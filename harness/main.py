@@ -11,13 +11,24 @@ from typing import Any
 import uuid
 
 from harness.auth import LocalSigner
-from harness.client import BenchmarkClient, ConflictError, UrllibTransport
+from harness.client import (
+    BenchmarkClient,
+    BenchmarkError,
+    ConflictError,
+    UrllibTransport,
+)
 from harness.decide import (
+    LOCAL_ONLY_TOOLS,
     HttpCompleter,
     ProbeCompleter,
     current_cash,
     decide,
     flat_forecasts,
+    host_omitted_clock,
+    payload_leaks_local_protocol,
+    published_tools,
+    sanitize_catalog,
+    sanitize_hosted_payload,
 )
 from harness.fence import Fence, FenceBlock
 from harness.memory import PendingMutation, RunnerState, StateStore
@@ -38,8 +49,28 @@ MANIFEST = {
     "network_mode": "restricted",
 }
 
+PROBE_MANIFEST = {
+    **MANIFEST,
+    "name": "protocol-probe",
+    "models": ["protocol-probe"],
+}
+
 TERMINAL = frozenset({"completed", "bankrupt"})
 STOPPED = frozenset({"cancelled", "failed"})
+
+
+def parse_observation_clock(payload: Any) -> tuple[int, int, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        sequence = int(payload["sequence"])
+        simulated_day = int(payload["simulated_day"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    status = payload.get("status")
+    if not isinstance(status, str) or not status:
+        return None
+    return sequence, simulated_day, status
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -56,6 +87,34 @@ def load_config(path: Path) -> dict[str, Any]:
     raw_scenario = str(config.get("scenario", "conformance"))
     config["scenario_id"] = SCENARIOS.get(raw_scenario, raw_scenario)
     return config
+
+
+def _tools_since_advance(notes: list[str]) -> int:
+    """Cadence pressure since the last advance.
+
+    Mutating tools count toward the 3-tool advance cap. Inspect tools
+    (names starting with get_) do not, so a week can read cost info
+    before pricing. Fenced calls count as mutations so send/trade/offramp
+    cannot burn max_steps. Six tools of any kind still force advance.
+    """
+    mutations = 0
+    total = 0
+    for note in reversed(notes):
+        if note.startswith("advanced"):
+            break
+        if note.startswith("fence:") or note.startswith("rejected:"):
+            total += 1
+            mutations += 1
+            continue
+        if not note.startswith("acted:"):
+            continue
+        total += 1
+        tool = note.split(":", 1)[1]
+        if not tool.startswith("get_"):
+            mutations += 1
+    if total >= 6:
+        return 3
+    return mutations
 
 
 def _digest(payload: Any) -> str:
@@ -81,11 +140,18 @@ class Runner:
         fence: Fence | None = None,
         retries: dict[str, float] | None = None,
         clock: Any = time,
+        manifest: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.signer = signer
         self.completer = completer
+        if manifest is not None:
+            self.manifest = manifest
+        elif isinstance(completer, ProbeCompleter):
+            self.manifest = PROBE_MANIFEST
+        else:
+            self.manifest = MANIFEST
         self.trajectory = trajectory
         self.clock = clock
         self.state = store.load() or RunnerState(
@@ -95,6 +161,7 @@ class Runner:
         self.state.wallet_address = signer.address
         self.state.scenario_id = config["scenario_id"]
         self._loop_started = clock.monotonic()
+        self._unusable_run_ids: set[str] = set()
         self.client = client or BenchmarkClient(
             transport or UrllibTransport(config["host"]),
             fence=fence or Fence(),
@@ -109,36 +176,120 @@ class Runner:
         self.store.save(self.state)
 
     def authenticate(self) -> None:
-        challenge = self.client.create_challenge(self.signer.address)
-        signature = self.signer.sign_siwe_message(challenge["message"])
-        token = self.client.verify_challenge(
-            challenge_id=challenge["challenge_id"],
-            wallet_address=self.signer.address,
-            signature=signature,
+        try:
+            challenge = self.client.create_challenge(self.signer.address)
+        except BenchmarkError:
+            self._fail_auth()
+            return
+        message = challenge.get("message") if isinstance(challenge, dict) else None
+        challenge_id = (
+            challenge.get("challenge_id") if isinstance(challenge, dict) else None
         )
-        self.state.access_token = token["access_token"]
-        self.state.token_expires_at = token.get("expires_at")
-        participant = token.get("participant") or {}
-        self.state.wallet_address = participant.get(
-            "wallet_address", self.signer.address
+        if not isinstance(message, str) or not message:
+            self._fail_auth()
+            return
+        if not isinstance(challenge_id, str) or not challenge_id:
+            self._fail_auth()
+            return
+        try:
+            token = self.client.verify_challenge(
+                challenge_id=challenge_id,
+                wallet_address=self.signer.address,
+                signature=self.signer.sign_siwe_message(message),
+            )
+        except BenchmarkError:
+            self._fail_auth()
+            return
+        if not self._apply_session(token):
+            self._fail_auth()
+
+    def _apply_session(self, token: Any) -> bool:
+        if not isinstance(token, dict):
+            return False
+        access = token.get("access_token")
+        if not isinstance(access, str) or not access:
+            return False
+        self.state.access_token = access
+        expires = token.get("expires_at")
+        self.state.token_expires_at = expires if isinstance(expires, str) else None
+        participant = token.get("participant")
+        wallet = None
+        if isinstance(participant, dict):
+            wallet = participant.get("wallet_address")
+        self.state.wallet_address = (
+            wallet if isinstance(wallet, str) and wallet else self.signer.address
         )
         if self.state.phase == "new":
             self.state.phase = "authenticated"
         self.state.notes.append("authenticated")
         self.trajectory.append("auth", step=self.state.step)
         self.persist()
+        return True
+
+    def _fail_auth(self) -> None:
+        if "rejected:auth" not in self.state.notes:
+            self.state.notes.append("rejected:auth")
+        if self.state.status not in TERMINAL:
+            self.state.status = "failed"
+        self._stop_without_score()
 
     def run_until_terminal(self) -> RunnerState:
         budgets = self.config.get("budgets") or {}
         max_steps = int(budgets.get("max_steps", 600))
         wall_s = float(budgets.get("wall_clock_h", 24)) * 3600
         while self.state.phase != "terminal":
+            if self.state.pending is not None:
+                self.step()
+                continue
             if self.state.step >= max_steps:
-                raise RuntimeError("max_steps exceeded")
+                self._stop_on_budget("max_steps")
+                break
             if self.state.elapsed_s >= wall_s:
-                raise RuntimeError("wall_clock exceeded")
+                self._stop_on_budget("wall_clock")
+                break
             self.step()
+        self._ensure_terminal_ticket()
         return self.state
+
+    def _stop_on_budget(self, reason: str) -> None:
+        if self.state.status in TERMINAL:
+            self._fetch_terminal()
+            return
+        if self.state.status in STOPPED:
+            self._stop_without_score()
+            return
+        if self.state.run_id is not None and self.state.status == "running":
+            try:
+                cash = current_cash(self.state.last_observation or {})
+                self._submit(
+                    "advance",
+                    f"/v1/runs/{self.state.run_id}/advance",
+                    {
+                        "sequence": self.state.sequence,
+                        "rationale": (
+                            f"Harness {reason} budget exhausted; "
+                            "advance to score the week."
+                        ),
+                        "forecasts": flat_forecasts(cash),
+                    },
+                )
+            except Exception:
+                pass
+        if self.state.phase == "terminal":
+            return
+        if self.state.status not in STOPPED | TERMINAL:
+            self.state.status = "failed"
+        self._file_gap_ticket(
+            kind="blocked",
+            title=f"Harness stopped on {reason}",
+            body=(
+                f"{reason} budget exhausted before the host went terminal. "
+                f"run_id={self.state.run_id} "
+                f"simulated_day={self.state.simulated_day}."
+            ),
+            tags=["loop", "budget", reason],
+        )
+        self._stop_without_score()
 
     def step(self) -> RunnerState:
         if self.state.pending is not None:
@@ -148,6 +299,8 @@ class Runner:
             self.authenticate()
             return self.state
         if self.state.run_id is None:
+            if self._adopt_live_run():
+                return self.state
             self._submit(
                 "create",
                 "/v1/runs",
@@ -155,7 +308,7 @@ class Runner:
                     "benchmark_version": "business-bench-saas-v0",
                     "track": self.config.get("track", "practice"),
                     "scenario_id": self.state.scenario_id,
-                    "participant_manifest": MANIFEST,
+                    "participant_manifest": self.manifest,
                 },
             )
             return self.state
@@ -220,21 +373,104 @@ class Runner:
             if self.state.run_id:
                 self._refresh_run()
             self.state.pending = None
+            if self.state.run_id is None:
+                self.persist()
+                return None
+            if self.state.status in STOPPED:
+                self._stop_without_score()
+                return None
+            if self.state.status in TERMINAL:
+                self._fetch_terminal()
+                return None
+            if pending.kind == "action":
+                tool = pending.body["actions"][0]["tool"]
+                self.state.notes.append(f"acted:{tool}")
+            elif pending.kind == "advance":
+                self.state.notes.append("advanced")
             self.persist()
             return None
+        except BenchmarkError as exc:
+            if pending.kind in {"action", "advance"} and exc.status_code in {400, 422}:
+                label = (
+                    pending.body["actions"][0]["tool"]
+                    if pending.kind == "action"
+                    else "advance"
+                )
+                self.trajectory.append(
+                    "rejected",
+                    step=self.state.step,
+                    kind=pending.kind,
+                    tool=label,
+                    http_status=exc.status_code,
+                )
+                self.state.last_action_result = {
+                    "error": str(exc.detail),
+                    "http_status": exc.status_code,
+                    "tool": label,
+                }
+                self.state.notes.append(f"rejected:{label}")
+                self.state.pending = None
+                self.persist()
+                return None
+            if pending.kind == "create" and exc.status_code in {400, 422}:
+                self.state.notes.append("rejected:create")
+                self.state.pending = None
+                self.state.status = "failed"
+                self._stop_without_score()
+                return None
+            if (
+                pending.kind == "create"
+                and self.state.run_id is None
+                and exc.status_code == 429
+                and self._adopt_live_run()
+            ):
+                self.state.pending = None
+                self.persist()
+                return None
+            if pending.kind in {"action", "advance"} and exc.status_code in {
+                429,
+                502,
+                503,
+                504,
+            }:
+                self.state.pending = None
+                self._handle_host_unavailable()
+                return None
+            raise
 
     def _finish(self, pending: PendingMutation, result: dict[str, Any]) -> None:
         if pending.kind == "create":
-            self._apply_run(result)
+            if not self._apply_run(result):
+                self.state.pending = None
+                if self._adopt_live_run():
+                    return
+                self.state.notes.append("rejected:create")
+                self.state.status = "failed"
+                self._stop_without_score()
+                return
             self.state.phase = "running"
-            self.state.notes.append(f"created:{result['run_id']}")
-            self.trajectory.append("create", run_id=result["run_id"], step=self.state.step)
+            self.state.notes.append(f"created:{self.state.run_id}")
+            self.trajectory.append("create", run_id=self.state.run_id, step=self.state.step)
         elif pending.kind == "action":
             tool = pending.body["actions"][0]["tool"]
-            self.state.sequence = int(result["sequence"])
+            if not self._apply_sequence(result):
+                if not self._refresh_or_recover_clock():
+                    self.state.pending = None
+                    return
             self.state.last_tool = tool
-            self.state.last_action_result = result
+            leaked = payload_leaks_local_protocol(result)
+            self.state.last_action_result = sanitize_hosted_payload(result)
             self.state.notes.append(f"acted:{tool}")
+            if leaked:
+                self._file_gap_ticket(
+                    kind="docs",
+                    title="Tool result leaked local next_week copy",
+                    body=(
+                        f"{tool} output mentioned next_week or python_exec. "
+                        "Hosted time moves via POST /advance. Tools do not move time."
+                    ),
+                    tags=["loop", "tools", "next_week"],
+                )
             self.trajectory.append(
                 "act",
                 step=self.state.step,
@@ -243,9 +479,13 @@ class Runner:
                 args_digest=_digest(pending.body["actions"][0].get("arguments", {})),
             )
         elif pending.kind == "advance":
-            self.state.sequence = int(result["sequence"])
-            self.state.simulated_day = int(result["simulated_day"])
-            self.state.status = result["status"]
+            if not self._apply_observation(result):
+                self.state.pending = None
+                if not self._refresh_or_recover_clock():
+                    return
+                self.state.notes.append("advanced")
+                self.persist()
+                return
             self.state.last_observation = result
             self.trajectory.append(
                 "advance",
@@ -284,19 +524,78 @@ class Runner:
 
     def _observe_decide(self) -> None:
         assert self.state.run_id is not None
-        observation = self.client.get_observation(self.state.run_id)
-        self.state.sequence = int(observation["sequence"])
-        self.state.simulated_day = int(observation["simulated_day"])
-        self.state.status = observation["status"]
-        self.state.last_observation = observation
+        try:
+            observation = self.client.get_observation(self.state.run_id)
+        except BenchmarkError as exc:
+            if self._handle_read_error(exc):
+                return
+            raise
+        if not self._apply_observation(observation):
+            if not self._refresh_or_recover_clock():
+                return
+        else:
+            self.state.last_observation = observation
         if self.state.status in TERMINAL:
             self._fetch_terminal()
             return
         if self.state.status in STOPPED:
             self._stop_without_score()
             return
-        tools = self.client.get_tools(self.state.run_id)
-        catalog = list(tools.get("tools") or [])
+        if host_omitted_clock(observation):
+            self._file_gap_ticket(
+                kind="gym_change",
+                title="Observation omitted data.clock",
+                body=(
+                    "GET observation had no data.clock. Hosted time still moves "
+                    "only via POST /advance by 7 days. Tools do not move time."
+                ),
+                tags=["loop", "observation", "clock"],
+            )
+        if payload_leaks_local_protocol(observation):
+            self._file_gap_ticket(
+                kind="docs",
+                title="Observation leaked local next_week copy",
+                body=(
+                    "Observation text still mentions next_week or python_exec. "
+                    "Hosted time moves via POST /advance. Tools do not move time."
+                ),
+                tags=["loop", "observation", "next_week"],
+            )
+        try:
+            tools = self.client.get_tools(self.state.run_id)
+        except BenchmarkError as exc:
+            if self._handle_read_error(exc):
+                return
+            raise
+        raw_catalog = published_tools(tools)
+        if not any(
+            isinstance(item, dict) and item.get("name") == "get_cost_info"
+            for item in raw_catalog
+        ):
+            try:
+                self._refresh_run()
+            except BenchmarkError:
+                pass
+            if self.state.status in TERMINAL:
+                self._fetch_terminal()
+                return
+            if self.state.status in STOPPED:
+                self._stop_without_score()
+                return
+            self.state.status = "failed"
+            self._stop_without_score()
+            return
+        if any(item["name"] in LOCAL_ONLY_TOOLS for item in raw_catalog):
+            self._file_gap_ticket(
+                kind="docs",
+                title="Hosted catalog leaked local-only tools",
+                body=(
+                    "GET /tools included next_week, python_exec, or the "
+                    "daily-calculation family. Hosted time moves via POST /advance."
+                ),
+                tags=["loop", "tools", "next_week"],
+            )
+        catalog = sanitize_catalog(raw_catalog)
         self.client.fence.set_allowlist(
             [item["name"] for item in catalog if "name" in item]
         )
@@ -305,6 +604,7 @@ class Runner:
             catalog=catalog,
             observation=observation,
             last_action_result=self.state.last_action_result,
+            tools_since_advance=_tools_since_advance(self.state.notes),
         )
         self.state.step += 1
         self.state.forecast_fallback = repair is not None
@@ -357,61 +657,376 @@ class Runner:
 
     def _fetch_terminal(self) -> None:
         assert self.state.run_id is not None
-        score = self.client.get_score(self.state.run_id)
-        host_trajectory = self.client.get_trajectory(self.state.run_id)
+        try:
+            score = self.client.get_score(self.state.run_id)
+        except ConflictError:
+            if self.state.run_id:
+                self._refresh_run()
+            if self.state.status not in STOPPED:
+                self.state.status = "failed"
+            self._stop_without_score()
+            return
+        except BenchmarkError as exc:
+            if exc.status_code in {429, 502, 503, 504}:
+                self.state.notes.append("score:unavailable")
+                if self.state.status not in TERMINAL:
+                    if self.state.status not in STOPPED:
+                        self.state.status = "failed"
+                    self._stop_without_score()
+                    return
+                self.state.phase = "terminal"
+                self.persist()
+                return
+            if exc.status_code != 404 or not self._recover_missing_run():
+                raise
+            if self.state.run_id is None:
+                self.state.status = "failed"
+                self._stop_without_score()
+                return
+            if self.state.status not in TERMINAL:
+                return
+            score = self.client.get_score(self.state.run_id)
+        if not isinstance(score, dict):
+            self.state.notes.append("score:incomplete")
+            self._stop_without_score()
+            return
+        digest = score.get("trajectory_digest")
+        try:
+            host_trajectory = self.client.get_trajectory(self.state.run_id)
+            digest = host_trajectory.get("trajectory_digest") or digest
+        except (ConflictError, BenchmarkError):
+            host_trajectory = {"trajectory_digest": digest}
         self.state.phase = "terminal"
-        self.state.status = score.get("terminal_state", self.state.status)
+        terminal_state = score.get("terminal_state")
+        if isinstance(terminal_state, str) and terminal_state:
+            self.state.status = terminal_state
+        if score.get("primary_score") is None:
+            self.state.notes.append("score:incomplete")
         self.state.notes.append("terminal")
         self.trajectory.append(
             "terminal",
             step=self.state.step,
             primary_score=score.get("primary_score"),
             terminal_state=score.get("terminal_state"),
-            trajectory_digest=host_trajectory.get("trajectory_digest"),
+            trajectory_digest=digest,
         )
         self.persist()
+        self._ensure_terminal_ticket(score)
+
+    def _ensure_terminal_ticket(self, score: dict[str, Any] | None = None) -> None:
         if not self.config.get("file_terminal_ticket", True):
             return
-        ticket = self.client.create_ticket(
-            idempotency_key=f"terminal-ticket-{self.state.run_id}",
-            kind="score_report",
-            severity="low",
-            title=f"{self.state.scenario_id} {score.get('terminal_state')}",
-            body=(
-                f"scenario_id={self.state.scenario_id} "
-                f"terminal_state={score.get('terminal_state')} "
-                f"primary_score={score.get('primary_score')} "
-                f"simulated_day={self.state.simulated_day}"
-            ),
-            run_id=self.state.run_id,
-            phase="after_run",
-            tags=["reference-harness", "score-report"],
-            score_snapshot={
-                "source": "host",
-                "primary_score": score.get("primary_score"),
-                "terminal_state": score.get("terminal_state"),
-                "simulated_day": self.state.simulated_day,
-            },
-        )
-        self.state.notes.append(f"ticket:{ticket.get('ticket_id')}")
+        if self.state.run_id is None or self.state.status not in TERMINAL:
+            return
+        if any(
+            note.startswith("ticket:score_report") or note == "ticket:conflict"
+            for note in self.state.notes
+        ):
+            return
+        if score is None:
+            try:
+                score = self.client.get_score(self.state.run_id)
+            except (ConflictError, BenchmarkError):
+                return
+        existing = self._existing_ticket_id("score_report")
+        if existing:
+            self.state.notes.append(f"ticket:score_report:{existing}")
+            self.persist()
+            return
+        try:
+            ticket = self.client.create_ticket(
+                idempotency_key=f"terminal-ticket-{self.state.run_id}",
+                kind="score_report",
+                severity="low",
+                title=f"{self.state.scenario_id} {score.get('terminal_state')}",
+                body=(
+                    f"scenario_id={self.state.scenario_id} "
+                    f"terminal_state={score.get('terminal_state')} "
+                    f"primary_score={score.get('primary_score')} "
+                    f"simulated_day={self.state.simulated_day}"
+                ),
+                run_id=self.state.run_id,
+                phase="after_run",
+                tags=["reference-harness", "score-report"],
+                score_snapshot={
+                    "source": "host",
+                    "primary_score": score.get("primary_score"),
+                    "terminal_state": score.get("terminal_state"),
+                    "simulated_day": self.state.simulated_day,
+                },
+            )
+        except ConflictError:
+            self.state.notes.append("ticket:conflict")
+            self.persist()
+            return
+        except BenchmarkError:
+            self.state.notes.append("ticket:failed")
+            self.persist()
+            return
+        self.state.notes.append(f"ticket:score_report:{ticket.get('ticket_id')}")
         self.persist()
+
+    def _has_ticket_note(self, kind: str) -> bool:
+        prefix = f"ticket:{kind}"
+        return any(note.startswith(prefix) for note in self.state.notes)
+
+    def _existing_ticket_id(self, kind: str) -> str | None:
+        if self.state.run_id is None:
+            return None
+        try:
+            listed = self.client.list_run_tickets(self.state.run_id)
+        except BenchmarkError:
+            try:
+                listed = self.client.list_tickets(
+                    kind=kind,
+                    run_id=self.state.run_id,
+                    limit=50,
+                    offset=0,
+                )
+            except BenchmarkError:
+                return None
+        tickets = listed.get("tickets") if isinstance(listed, dict) else None
+        if not isinstance(tickets, list):
+            return None
+        for ticket in tickets:
+            if not isinstance(ticket, dict):
+                continue
+            if ticket.get("kind") != kind:
+                continue
+            ticket_run = ticket.get("run_id")
+            if ticket_run is not None and ticket_run != self.state.run_id:
+                continue
+            ticket_id = ticket.get("ticket_id")
+            if isinstance(ticket_id, str) and ticket_id:
+                return ticket_id
+        return None
+
+    def _file_gap_ticket(
+        self,
+        *,
+        kind: str,
+        title: str,
+        body: str,
+        tags: list[str],
+    ) -> None:
+        if self.state.run_id is None or self._has_ticket_note(kind):
+            return
+        existing = self._existing_ticket_id(kind)
+        if existing:
+            self.state.notes.append(f"ticket:{kind}:{existing}")
+            self.persist()
+            return
+        try:
+            ticket = self.client.create_ticket(
+                idempotency_key=f"{kind}-ticket-{self.state.run_id}",
+                kind=kind,
+                severity="medium",
+                title=title,
+                body=body,
+                run_id=self.state.run_id,
+                phase="during_run",
+                tags=["reference-harness", *tags],
+            )
+        except ConflictError:
+            self.state.notes.append(f"ticket:{kind}:conflict")
+            self.persist()
+            return
+        except BenchmarkError:
+            return
+        self.state.notes.append(f"ticket:{kind}:{ticket.get('ticket_id')}")
+        self.persist()
+
+    def _list_runs(self) -> list[dict[str, Any]] | None:
+        try:
+            collected: list[dict[str, Any]] = []
+            offset = 0
+            while True:
+                listed = self.client.list_runs(limit=50, offset=offset or None)
+                page = list(listed.get("runs") or [])
+                collected.extend(page)
+                wanted = self.state.run_id
+                if (
+                    wanted
+                    and wanted not in self._unusable_run_ids
+                    and any(item.get("run_id") == wanted for item in collected)
+                ):
+                    return collected
+                if self._live_listed_run(collected) is not None:
+                    return collected
+                total = listed.get("total")
+                if not page or total is None or offset + len(page) >= int(total):
+                    return collected
+                offset += len(page)
+        except BenchmarkError:
+            return None
+
+    def _live_listed_run(self, runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in runs
+                if item.get("status") in {"queued", "running"}
+                and item.get("scenario_version") == self.state.scenario_id
+                and item.get("run_id") not in self._unusable_run_ids
+            ),
+            None,
+        )
+
+    def _adopt_live_run(self) -> bool:
+        runs = self._list_runs()
+        if runs is None:
+            return False
+        match = self._live_listed_run(runs)
+        if match is None or not self._apply_run(match):
+            return False
+        self.state.phase = "running"
+        self.state.notes.append(f"resumed:{match['run_id']}")
+        self.persist()
+        return True
+
+    def _apply_sequence(self, payload: dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        try:
+            self.state.sequence = int(payload["sequence"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
+
+    def _apply_observation(self, payload: dict[str, Any]) -> bool:
+        parsed = parse_observation_clock(payload)
+        if parsed is None:
+            return False
+        sequence, simulated_day, status = parsed
+        self.state.sequence = sequence
+        self.state.simulated_day = simulated_day
+        self.state.status = status
+        return True
+
+    def _refresh_or_recover_clock(self) -> bool:
+        before = self.state.run_id
+        if self.state.run_id:
+            try:
+                self._refresh_run()
+            except BenchmarkError:
+                self._handle_read_conflict()
+                return False
+        if self.state.run_id != before:
+            return False
+        if self.state.status in TERMINAL:
+            self._fetch_terminal()
+            return False
+        if self.state.status in STOPPED:
+            self._stop_without_score()
+            return False
+        if self.state.status == "running":
+            return True
+        self._handle_read_conflict()
+        return False
+
+    def _handle_read_error(self, exc: BenchmarkError) -> bool:
+        if exc.status_code == 404 and self._recover_missing_run():
+            return True
+        if exc.status_code == 409:
+            self._handle_read_conflict()
+            return True
+        if exc.status_code in {429, 502, 503, 504}:
+            self._handle_host_unavailable()
+            return True
+        return False
+
+    def _handle_host_unavailable(self) -> None:
+        if "host:unavailable" not in self.state.notes:
+            self.state.notes.append("host:unavailable")
+        if self.state.run_id:
+            try:
+                self._refresh_run()
+            except BenchmarkError:
+                pass
+        if self.state.status in TERMINAL:
+            self._fetch_terminal()
+            return
+        if self.state.status in STOPPED:
+            self._stop_without_score()
+            return
+        self.state.status = "failed"
+        self._stop_without_score()
+
+    def _handle_read_conflict(self) -> None:
+        before = self.state.run_id
+        if self.state.run_id:
+            try:
+                self._refresh_run()
+            except BenchmarkError:
+                pass
+        if self.state.run_id != before:
+            return
+        if self.state.status in TERMINAL:
+            self._fetch_terminal()
+            return
+        if self.state.status in STOPPED:
+            self._stop_without_score()
+            return
+        if self._recover_missing_run():
+            return
+        self.state.status = "failed"
+        self._stop_without_score()
+
+    def _recover_missing_run(self) -> bool:
+        wanted = self.state.run_id
+        if wanted:
+            self._unusable_run_ids.add(wanted)
+        runs = self._list_runs()
+        if runs is None:
+            return False
+        match = self._live_listed_run(runs)
+        if match is not None and self._apply_run(match):
+            self.state.notes.append(f"recovered:{match['run_id']}")
+            self.persist()
+            return True
+        self.state.notes.append(f"lost-run:{self.state.run_id}")
+        self.state.run_id = None
+        self.state.status = None
+        self.state.sequence = 0
+        self.state.pending = None
+        self.persist()
+        return True
 
     def _refresh_run(self) -> None:
         assert self.state.run_id is not None
-        self._apply_run(self.client.get_run(self.state.run_id))
+        try:
+            run = self.client.get_run(self.state.run_id)
+        except BenchmarkError as exc:
+            if exc.status_code == 404 and self._recover_missing_run():
+                return
+            raise
+        if not self._apply_run(run) and not self._recover_missing_run():
+            raise BenchmarkError(422, "malformed_run", f"/v1/runs/{self.state.run_id}")
 
-    def _apply_run(self, run: dict[str, Any]) -> None:
-        self.state.run_id = run["run_id"]
-        self.state.sequence = int(run["sequence"])
+    def _apply_run(self, run: dict[str, Any]) -> bool:
+        if not isinstance(run, dict):
+            return False
+        run_id = run.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            return False
+        try:
+            sequence = int(run["sequence"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        status = run.get("status")
+        self.state.run_id = run_id
+        self.state.sequence = sequence
         self.state.simulated_day = int(run.get("simulated_day") or 0)
-        self.state.status = run.get("status")
+        self.state.status = status if isinstance(status, str) else "running"
+        return True
 
 
 def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Runner:
     state_dir = Path(config["state_dir"])
     model = config.get("model") or {}
+    provider_url = str(model.get("provider_url") or "")
+    manifest = MANIFEST
     if completer is None:
-        provider_url = str(model.get("provider_url") or "")
         if provider_url == "probe://local":
             completer = ProbeCompleter()
         else:
@@ -425,6 +1040,10 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
                     (config.get("budgets") or {}).get("call_timeout_s", 120)
                 ),
             )
+    if isinstance(completer, ProbeCompleter) or provider_url == "probe://local":
+        manifest = PROBE_MANIFEST
+    elif model.get("name"):
+        manifest = {**MANIFEST, "models": [str(model["name"])]}
     return Runner(
         config=config,
         store=StateStore(state_dir / "state.json"),
@@ -437,6 +1056,7 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
         ),
         fence=Fence(),
         retries=config.get("retries"),
+        manifest=manifest,
     )
 
 

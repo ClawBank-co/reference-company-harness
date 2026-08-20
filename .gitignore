@@ -10,6 +10,7 @@ state.json
 state.json.tmp
 *.hex
 config.json
+model.key
 .env
 trajectory.jsonl
 .DS_Store

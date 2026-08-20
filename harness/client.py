@@ -6,6 +6,7 @@ import json
 import time
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from harness.fence import Fence
@@ -161,10 +162,17 @@ class BenchmarkClient:
     def get_run(self, run_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/runs/{run_id}")
 
-    def list_runs(self, *, limit: int | None = None) -> dict[str, Any]:
-        path = "/v1/runs"
+    def list_runs(
+        self, *, limit: int | None = None, offset: int | None = None
+    ) -> dict[str, Any]:
+        query: list[str] = []
         if limit is not None:
-            path = f"{path}?limit={int(limit)}"
+            query.append(f"limit={int(limit)}")
+        if offset:
+            query.append(f"offset={int(offset)}")
+        path = "/v1/runs"
+        if query:
+            path = f"{path}?{'&'.join(query)}"
         return self._request("GET", path)
 
     def cancel_run(
@@ -259,6 +267,37 @@ class BenchmarkClient:
             idempotency_key=idempotency_key,
             expected_status=201,
         )
+
+    def list_tickets(
+        self,
+        *,
+        kind: str | None = None,
+        status: str | None = None,
+        run_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        query = {
+            key: value
+            for key, value in {
+                "kind": kind,
+                "status": status,
+                "run_id": run_id,
+                "limit": limit,
+                "offset": offset,
+            }.items()
+            if value is not None
+        }
+        path = "/v1/tickets"
+        if query:
+            path = f"{path}?{urlencode(query)}"
+        return self._request("GET", path)
+
+    def get_ticket(self, ticket_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/tickets/{ticket_id}")
+
+    def list_run_tickets(self, run_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/runs/{run_id}/tickets")
 
     def _request(
         self,

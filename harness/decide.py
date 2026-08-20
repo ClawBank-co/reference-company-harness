@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Protocol
+import time
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+TRANSIENT_LLM_STATUS = frozenset({429, 502, 503, 504})
+
 HORIZONS = (7, 28, 84, 182)
+LOCAL_ONLY_TOOLS = frozenset(
+    {
+        "next_week",
+        "python_exec",
+        "register_daily_calculation",
+        "remove_daily_calculation",
+        "list_daily_calculations",
+        "get_tool_documentation",
+    }
+)
 
 SYSTEM_PROMPT = """You are the bounded runner for a company operating Acme AI on ClawBank Business Bench.
 
@@ -16,6 +29,7 @@ Objective: maximize cash. Cash is the score. Bankruptcy (cash < 0) ends the run.
 
 You talk to a hosted gym over REST. You do not invent tools. The live catalog is injected below.
 Time moves only when you choose action=advance. Hosted mode has no next_week and no python_exec.
+Read data.clock: tools_move_time is false; POST /advance moves advance_days (7).
 
 Each turn return ONE JSON object, no markdown, no prose:
 
@@ -30,6 +44,10 @@ Each turn return ONE JSON object, no markdown, no prose:
 Forecasts are cash dollars. Horizons must be exactly 7, 28, 84, 182 in that order. Each row must satisfy lower <= point <= upper.
 
 Never call send, trade, or offramp. Never request real-money movement. One tool per turn.
+Call get_cost_info before mutations or advance. Other get_* tools do not count as that inspect.
+After at most 3 mutating tools since the last advance, you MUST action=advance.
+Six tools of any kind in one week also require advance. Fenced tools count.
+A week of only tool calls never moves time and never scores.
 """
 
 
@@ -70,12 +88,18 @@ class HttpCompleter:
         api_key: str,
         max_tokens: int = 4096,
         timeout_s: float = 120.0,
+        retries: int = 5,
+        sleeper: Callable[[float], None] = time.sleep,
+        opener: Callable[..., Any] = urlopen,
     ) -> None:
         self.provider_url = provider_url
         self.model = model
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
+        self.retries = max(1, int(retries))
+        self._sleeper = sleeper
+        self._opener = opener
 
     def complete(self, messages: list[dict[str, str]]) -> str:
         body = json.dumps(
@@ -84,28 +108,49 @@ class HttpCompleter:
                 "messages": messages,
                 "max_tokens": self.max_tokens,
                 "temperature": 0,
+                "response_format": {"type": "json_object"},
             }
         ).encode("utf-8")
-        request = Request(
-            self.provider_url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.timeout_s) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raise RuntimeError(f"llm_http_{exc.code}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"llm_transport: {exc.reason}") from exc
+        last_error: Exception | None = None
+        payload: dict[str, Any] | None = None
+        for attempt in range(self.retries):
+            request = Request(
+                self.provider_url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with self._opener(request, timeout=self.timeout_s) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code in TRANSIENT_LLM_STATUS and attempt + 1 < self.retries:
+                    self._sleeper(min(60.0, 2.0**attempt))
+                    continue
+                raise RuntimeError(f"llm_http_{exc.code}") from exc
+            except URLError as exc:
+                last_error = exc
+                if attempt + 1 < self.retries:
+                    self._sleeper(min(60.0, 2.0**attempt))
+                    continue
+                raise RuntimeError(f"llm_transport: {exc.reason}") from exc
+        if payload is None:
+            raise RuntimeError("llm_retries_exhausted") from last_error
         choices = payload.get("choices") or []
         if not choices:
             raise RuntimeError("llm_empty_choices")
-        return str(choices[0].get("message", {}).get("content") or "")
+        content = choices[0].get("message", {}).get("content")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content or "")
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -221,22 +266,198 @@ def flat_forecasts(cash: float) -> list[dict[str, float | int]]:
     ]
 
 
+def rewrite_local_protocol_text(text: str) -> str:
+    """Live/stale gyms still mention next_week; the hosted clock is POST /advance."""
+    rewritten = text
+    replacements = (
+        (
+            "Changes take effect on next_week.",
+            "Changes take effect on POST /advance.",
+        ),
+        ("when next_week is called", "when you POST /advance"),
+        (
+            "call next_week to advance.",
+            "POST /advance to move 7 days. Tools do not move time.",
+        ),
+        ("then call next_week", "then POST /advance"),
+        ("call next_week", "POST /advance"),
+        ("next_week", "POST /advance"),
+        ("via python_exec()", "via list_all_tables or describe_tables"),
+        ("python_exec / query", "describe_tables"),
+        ("python_exec", "list_all_tables"),
+    )
+    for old, new in replacements:
+        rewritten = rewritten.replace(old, new)
+    return rewritten
+
+
+def payload_leaks_local_protocol(value: Any) -> bool:
+    """True when a live/stale host still teaches next_week or python_exec."""
+    if isinstance(value, str):
+        return any(
+            token in value
+            for token in LOCAL_ONLY_TOOLS
+        )
+    if isinstance(value, list):
+        return any(payload_leaks_local_protocol(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            key in LOCAL_ONLY_TOOLS or payload_leaks_local_protocol(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def sanitize_hosted_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return rewrite_local_protocol_text(value)
+    if isinstance(value, list):
+        return [sanitize_hosted_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: sanitize_hosted_payload(item)
+            for key, item in value.items()
+            if key not in LOCAL_ONLY_TOOLS
+        }
+    return value
+
+
+def published_tools(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        raw = payload.get("tools")
+    elif isinstance(payload, list):
+        raw = payload
+    else:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [
+        item
+        for item in raw
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+
+
+def sanitize_catalog(catalog: Any) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for item in published_tools(catalog):
+        name = item.get("name")
+        if name in LOCAL_ONLY_TOOLS:
+            continue
+        cleaned.append(sanitize_hosted_payload(item))
+    return cleaned
+
+
+def last_action_tool(result: dict[str, Any] | None) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    rows = result.get("results")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        name = rows[0].get("tool")
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def needs_inspect(
+    *,
+    catalog_names: set[str],
+    last_action_result: dict[str, Any] | None,
+    tools_since_advance: int,
+) -> bool:
+    """True when this week has not inspected and get_cost_info is published."""
+    if tools_since_advance >= 3 or "get_cost_info" not in catalog_names:
+        return False
+    if tools_since_advance > 0:
+        return False
+    return last_action_tool(last_action_result) != "get_cost_info"
+
+
+def host_omitted_clock(observation: Any) -> bool:
+    if not isinstance(observation, dict):
+        return True
+    data = observation.get("data")
+    if not isinstance(data, dict):
+        return True
+    clock = data.get("clock")
+    return not (
+        isinstance(clock, dict)
+        and clock.get("advance_days") == 7
+        and clock.get("tools_move_time") is False
+        and "simulated_day" in clock
+    )
+
+
+def ensure_observation_clock(observation: Any) -> Any:
+    """Live gyms omit data.clock; the hosted week is still 7 days via POST /advance."""
+    if not isinstance(observation, dict):
+        return observation
+    obs = dict(observation)
+    data = dict(obs["data"]) if isinstance(obs.get("data"), dict) else {}
+    clock = data.get("clock") if isinstance(data.get("clock"), dict) else {}
+    try:
+        day = int(obs.get("simulated_day", clock.get("simulated_day") or 0))
+    except (TypeError, ValueError):
+        day = 0
+    if (
+        clock.get("advance_days") != 7
+        or clock.get("tools_move_time") is not False
+        or "simulated_day" not in clock
+    ):
+        data["clock"] = {
+            "simulated_day": day,
+            "advance_days": 7,
+            "tools_move_time": False,
+        }
+    obs["data"] = data
+    return obs
+
+
 def build_messages(
     *,
     catalog: list[dict[str, Any]],
     observation: dict[str, Any],
     last_action_result: dict[str, Any] | None,
     repair: str | None = None,
+    tools_since_advance: int = 0,
 ) -> list[dict[str, str]]:
     user = {
-        "observation": observation,
-        "last_action_result": last_action_result,
-        "tools": catalog,
+        "observation": ensure_observation_clock(sanitize_hosted_payload(observation)),
+        "last_action_result": sanitize_hosted_payload(last_action_result),
+        "tools": sanitize_catalog(catalog),
+        "tools_since_advance": tools_since_advance,
     }
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(user, default=str)},
     ]
+    catalog_names = {
+        item["name"] for item in catalog if isinstance(item.get("name"), str)
+    }
+    if needs_inspect(
+        catalog_names=catalog_names,
+        last_action_result=last_action_result,
+        tools_since_advance=tools_since_advance,
+    ):
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "This week has no get_cost_info yet. Call get_cost_info "
+                    "before mutating or advancing."
+                ),
+            }
+        )
+    if tools_since_advance >= 3:
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "You already used 3 mutating tools or 6 tools since the last "
+                    "advance. Return action=advance with cash forecasts. Do not call a tool."
+                ),
+            }
+        )
     if repair:
         messages.append({"role": "user", "content": f"Previous output failed validation: {repair}. Return one valid JSON object."})
     return messages
@@ -248,17 +469,25 @@ def decide(
     catalog: list[dict[str, Any]],
     observation: dict[str, Any],
     last_action_result: dict[str, Any] | None = None,
+    tools_since_advance: int = 0,
 ) -> tuple[dict[str, Any], str | None]:
-    """Parse one model decision. Second failure → flat-forecast advance."""
+    """Parse one model decision. Second failure → inspect or flat-forecast advance."""
     tools = {item["name"]: item for item in catalog if "name" in item}
     error: str | None = None
     parsed: dict[str, Any] | None = None
+    must_advance = tools_since_advance >= 3
+    inspect_first = needs_inspect(
+        catalog_names=set(tools),
+        last_action_result=last_action_result,
+        tools_since_advance=tools_since_advance,
+    )
     for attempt in range(2):
         messages = build_messages(
             catalog=catalog,
             observation=observation,
             last_action_result=last_action_result,
             repair=error,
+            tools_since_advance=tools_since_advance,
         )
         raw = completer.complete(messages)
         try:
@@ -268,8 +497,30 @@ def decide(
             error = str(exc)
             parsed = None
         if error is None and parsed is not None:
+            if must_advance and parsed.get("action") != "advance":
+                error = "must advance after 3 tools this week"
+                parsed = None
+                continue
+            if inspect_first and parsed.get("tool") != "get_cost_info":
+                error = "inspect with get_cost_info before mutating or advancing"
+                parsed = None
+                continue
             return parsed, None
     cash = current_cash(observation)
+    if must_advance:
+        return (
+            {
+                "action": "advance",
+                "rationale": "Three tools already ran this week; advancing time.",
+                "forecasts": flat_forecasts(cash),
+            },
+            error or "must_advance",
+        )
+    if "get_cost_info" in tools:
+        return (
+            {"action": "tool", "tool": "get_cost_info", "args": {}},
+            error or "invalid_model_output",
+        )
     fallback = {
         "action": "advance",
         "rationale": "Validation failed twice; advancing with a flat cash forecast.",
@@ -278,7 +529,20 @@ def decide(
     return fallback, error or "invalid_model_output"
 
 
+def _normalize_action(parsed: dict[str, Any]) -> None:
+    action = parsed.get("action")
+    if isinstance(action, str):
+        parsed["action"] = action.strip().lower()
+        return
+    if parsed.get("tool"):
+        parsed["action"] = "tool"
+        return
+    if parsed.get("forecasts") is not None:
+        parsed["action"] = "advance"
+
+
 def _check_decision(parsed: dict[str, Any], tools: dict[str, dict[str, Any]]) -> str | None:
+    _normalize_action(parsed)
     action = parsed.get("action")
     if action == "advance":
         rationale = parsed.get("rationale")
@@ -291,4 +555,4 @@ def _check_decision(parsed: dict[str, Any], tools: dict[str, dict[str, Any]]) ->
             return f"unknown tool {name!r}"
         schema = tools[name].get("input_schema") or {"type": "object"}
         return validate_args(schema, parsed.get("args", {}))
-    return "action must be 'tool' or 'advance'"
+    return f"action must be 'tool' or 'advance', got {action!r}"

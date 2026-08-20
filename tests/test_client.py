@@ -122,9 +122,35 @@ class ClientTests(unittest.TestCase):
             reauthenticate=lambda: None,
             sleeper=lambda _: None,
         )
-        listed = client.list_runs(limit=10)
+        listed = client.list_runs(limit=10, offset=50)
         cancelled = client.cancel_run("run_1")
         self.assertEqual(listed["total"], 1)
         self.assertEqual(cancelled["status"], "cancelled")
-        self.assertEqual(transport.calls[0][:2], ("GET", "/v1/runs?limit=10"))
+        self.assertEqual(transport.calls[0][:2], ("GET", "/v1/runs?limit=10&offset=50"))
         self.assertEqual(transport.calls[1][:2], ("POST", "/v1/runs/run_1/cancel"))
+
+    def test_list_tickets_uses_public_query(self) -> None:
+        transport = ScriptedTransport(
+            [
+                TransportResponse(
+                    200,
+                    {"tickets": [], "count": 0, "total": 0, "offset": 0, "limit": 1},
+                    "ok",
+                )
+            ]
+        )
+        client = BenchmarkClient(
+            transport,
+            fence=Fence(),
+            get_access_token=lambda: "tok",
+            reauthenticate=lambda: None,
+            sleeper=lambda _: None,
+        )
+        listed = client.list_tickets(
+            kind="score_report", run_id="run_1", limit=1, offset=0
+        )
+        self.assertEqual(listed["total"], 0)
+        self.assertEqual(
+            transport.calls[0][:2],
+            ("GET", "/v1/tickets?kind=score_report&run_id=run_1&limit=1&offset=0"),
+        )
