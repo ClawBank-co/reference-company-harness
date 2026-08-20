@@ -37,6 +37,30 @@ class Completer(Protocol):
     def complete(self, messages: list[dict[str, str]]) -> str: ...
 
 
+class ProbeCompleter:
+    """One catalog probe, then flat-forecast advances. Not a scored baseline."""
+
+    def __init__(self) -> None:
+        self._acted = False
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        user = json.loads(messages[1]["content"])
+        tools = {item["name"] for item in user.get("tools") or [] if "name" in item}
+        if not self._acted and "get_cost_info" in tools:
+            self._acted = True
+            return json.dumps(
+                {"action": "tool", "tool": "get_cost_info", "args": {}}
+            )
+        cash = current_cash(user.get("observation") or {})
+        return json.dumps(
+            {
+                "action": "advance",
+                "rationale": "Protocol probe advance.",
+                "forecasts": flat_forecasts(cash),
+            }
+        )
+
+
 class HttpCompleter:
     def __init__(
         self,

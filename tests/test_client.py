@@ -107,3 +107,24 @@ class ClientTests(unittest.TestCase):
         body = client.get_score("run_1")
         self.assertEqual(body, {"ok": True})
         self.assertEqual(sleeps, [1.0])
+
+    def test_list_and_cancel_use_public_paths(self) -> None:
+        transport = ScriptedTransport(
+            [
+                TransportResponse(200, {"total": 1, "runs": [{"run_id": "run_1"}]}, "ok"),
+                TransportResponse(200, {"run_id": "run_1", "status": "cancelled"}, "ok"),
+            ]
+        )
+        client = BenchmarkClient(
+            transport,
+            fence=Fence(),
+            get_access_token=lambda: "tok",
+            reauthenticate=lambda: None,
+            sleeper=lambda _: None,
+        )
+        listed = client.list_runs(limit=10)
+        cancelled = client.cancel_run("run_1")
+        self.assertEqual(listed["total"], 1)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(transport.calls[0][:2], ("GET", "/v1/runs?limit=10"))
+        self.assertEqual(transport.calls[1][:2], ("POST", "/v1/runs/run_1/cancel"))

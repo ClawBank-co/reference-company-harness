@@ -33,6 +33,8 @@ python -m unittest discover -s tests -v
 
 Existing `state.json` means resume. A kill loses only the in-flight HTTP call. Terminal runs POST `kind=score_report` when `file_terminal_ticket` is true.
 
+`model.provider_url` of `probe://local` skips the LLM and issues canned `get_cost_info` plus flat-forecast advances. That is a protocol probe, not a scored baseline. Do not cite those rows.
+
 ## License
 
 MIT.

@@ -161,6 +161,21 @@ class BenchmarkClient:
     def get_run(self, run_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/runs/{run_id}")
 
+    def list_runs(self, *, limit: int | None = None) -> dict[str, Any]:
+        path = "/v1/runs"
+        if limit is not None:
+            path = f"{path}?limit={int(limit)}"
+        return self._request("GET", path)
+
+    def cancel_run(
+        self, run_id: str, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/runs/{run_id}/cancel",
+            idempotency_key=idempotency_key,
+        )
+
     def get_observation(self, run_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/runs/{run_id}/observation")
 

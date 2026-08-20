@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,14 @@ class RunnerState:
         payload = asdict(self)
         for key in SECRET_FIELDS:
             payload.pop(key, None)
+        for key in ("last_observation", "last_action_result"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                blob = json.dumps(value, default=str, sort_keys=True).encode("utf-8")
+                payload[key] = {
+                    "digest": hashlib.sha256(blob).hexdigest()[:16],
+                    "keys": sorted(value),
+                }
         return payload
 
 

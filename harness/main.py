@@ -12,7 +12,13 @@ import uuid
 
 from harness.auth import LocalSigner
 from harness.client import BenchmarkClient, ConflictError, UrllibTransport
-from harness.decide import HttpCompleter, current_cash, decide, flat_forecasts
+from harness.decide import (
+    HttpCompleter,
+    ProbeCompleter,
+    current_cash,
+    decide,
+    flat_forecasts,
+)
 from harness.fence import Fence, FenceBlock
 from harness.memory import PendingMutation, RunnerState, StateStore
 from harness.trajectory import Trajectory
@@ -33,6 +39,7 @@ MANIFEST = {
 }
 
 TERMINAL = frozenset({"completed", "bankrupt"})
+STOPPED = frozenset({"cancelled", "failed"})
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -155,6 +162,9 @@ class Runner:
         if self.state.status in TERMINAL:
             self._fetch_terminal()
             return self.state
+        if self.state.status in STOPPED:
+            self._stop_without_score()
+            return self.state
         self._observe_decide()
         return self.state
 
@@ -248,6 +258,10 @@ class Runner:
                 self.state.pending = None
                 self._fetch_terminal()
                 return
+            if self.state.status in STOPPED:
+                self.state.pending = None
+                self._stop_without_score()
+                return
             self.state.notes.append("advanced")
         self.state.pending = None
         self.persist()
@@ -271,11 +285,6 @@ class Runner:
     def _observe_decide(self) -> None:
         assert self.state.run_id is not None
         observation = self.client.get_observation(self.state.run_id)
-        tools = self.client.get_tools(self.state.run_id)
-        catalog = list(tools.get("tools") or [])
-        self.client.fence.set_allowlist(
-            [item["name"] for item in catalog if "name" in item]
-        )
         self.state.sequence = int(observation["sequence"])
         self.state.simulated_day = int(observation["simulated_day"])
         self.state.status = observation["status"]
@@ -283,6 +292,14 @@ class Runner:
         if self.state.status in TERMINAL:
             self._fetch_terminal()
             return
+        if self.state.status in STOPPED:
+            self._stop_without_score()
+            return
+        tools = self.client.get_tools(self.state.run_id)
+        catalog = list(tools.get("tools") or [])
+        self.client.fence.set_allowlist(
+            [item["name"] for item in catalog if "name" in item]
+        )
         decision, repair = decide(
             self.completer,
             catalog=catalog,
@@ -327,6 +344,16 @@ class Runner:
                 "forecasts": forecasts,
             },
         )
+
+    def _stop_without_score(self) -> None:
+        self.state.phase = "terminal"
+        self.state.notes.append(self.state.status or "stopped")
+        self.trajectory.append(
+            "stopped",
+            step=self.state.step,
+            status=self.state.status,
+        )
+        self.persist()
 
     def _fetch_terminal(self) -> None:
         assert self.state.run_id is not None
@@ -384,14 +411,20 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
     state_dir = Path(config["state_dir"])
     model = config.get("model") or {}
     if completer is None:
-        api_key = Path(model["api_key_file"]).read_text(encoding="utf-8").strip()
-        completer = HttpCompleter(
-            provider_url=model["provider_url"],
-            model=model["name"],
-            api_key=api_key,
-            max_tokens=int(model.get("max_tokens", 4096)),
-            timeout_s=float((config.get("budgets") or {}).get("call_timeout_s", 120)),
-        )
+        provider_url = str(model.get("provider_url") or "")
+        if provider_url == "probe://local":
+            completer = ProbeCompleter()
+        else:
+            api_key = Path(model["api_key_file"]).read_text(encoding="utf-8").strip()
+            completer = HttpCompleter(
+                provider_url=provider_url,
+                model=model["name"],
+                api_key=api_key,
+                max_tokens=int(model.get("max_tokens", 4096)),
+                timeout_s=float(
+                    (config.get("budgets") or {}).get("call_timeout_s", 120)
+                ),
+            )
     return Runner(
         config=config,
         store=StateStore(state_dir / "state.json"),

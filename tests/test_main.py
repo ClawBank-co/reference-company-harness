@@ -214,3 +214,91 @@ class ReplayTests(unittest.TestCase):
         assert loaded is not None
         assert loaded.pending is not None
         self.assertEqual(loaded.pending.idempotency_key, "create-same-key-0001")
+
+    def test_cancelled_observation_stops_without_acting_or_scoring(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = StateStore(Path(tmp.name) / "state.json")
+        store.save(
+            RunnerState(
+                phase="running",
+                run_id="run_1",
+                sequence=1,
+                access_token="tok",
+                status="running",
+            )
+        )
+        transport = ScriptedTransport(
+            [
+                TransportResponse(
+                    200,
+                    {
+                        "run_id": "run_1",
+                        "sequence": 1,
+                        "simulated_day": 0,
+                        "status": "cancelled",
+                        "data": {"dashboard": ""},
+                    },
+                    "ok",
+                )
+            ]
+        )
+        client = BenchmarkClient(
+            transport,
+            fence=Fence(),
+            get_access_token=lambda: "tok",
+            reauthenticate=lambda: None,
+            sleeper=lambda _: None,
+        )
+        runner = Runner(
+            config={"scenario_id": "zhc-conformance-short-v0", "budgets": {"max_steps": 10}},
+            store=store,
+            client=client,
+            signer=_signer(tmp.name),
+            completer=lambda messages: '{"action":"advance","rationale":"nope"}',
+            trajectory=Trajectory(Path(tmp.name) / "trajectory.jsonl"),
+            clock=Clock(),
+        )
+        runner.step()
+        loaded = store.load()
+        assert loaded is not None
+        self.assertEqual(loaded.phase, "terminal")
+        self.assertEqual(loaded.status, "cancelled")
+        self.assertIn("cancelled", loaded.notes)
+        self.assertEqual(transport.calls, [("GET", "/v1/runs/run_1/observation")])
+
+    def test_failed_status_stops_without_host_calls(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = StateStore(Path(tmp.name) / "state.json")
+        store.save(
+            RunnerState(
+                phase="running",
+                run_id="run_1",
+                access_token="tok",
+                status="failed",
+            )
+        )
+        transport = ScriptedTransport([])
+        client = BenchmarkClient(
+            transport,
+            fence=Fence(),
+            get_access_token=lambda: "tok",
+            reauthenticate=lambda: None,
+            sleeper=lambda _: None,
+        )
+        runner = Runner(
+            config={"scenario_id": "zhc-conformance-short-v0", "budgets": {"max_steps": 10}},
+            store=store,
+            client=client,
+            signer=_signer(tmp.name),
+            completer=lambda messages: "",
+            trajectory=Trajectory(Path(tmp.name) / "trajectory.jsonl"),
+            clock=Clock(),
+        )
+        runner.step()
+        loaded = store.load()
+        assert loaded is not None
+        self.assertEqual(loaded.phase, "terminal")
+        self.assertEqual(loaded.status, "failed")
+        self.assertEqual(transport.calls, [])

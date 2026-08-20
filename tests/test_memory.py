@@ -25,7 +25,18 @@ class MemoryTests(unittest.TestCase):
         assert loaded is not None
         self.assertEqual(loaded.run_id, "run_1")
         self.assertEqual(loaded.sequence, 3)
-        self.assertNotIn("access_token", loaded.to_public_dict())
+        public = loaded.to_public_dict()
+        self.assertNotIn("access_token", public)
+
+    def test_public_dict_digests_observation_payloads(self) -> None:
+        state = RunnerState(
+            last_observation={"data": {"dashboard": "Cash: $1"}, "sequence": 2},
+            last_action_result={"results": [{"tool": "get_cost_info"}]},
+        )
+        public = state.to_public_dict()
+        self.assertNotIn("dashboard", json.dumps(public))
+        self.assertEqual(sorted(public["last_observation"]["keys"]), ["data", "sequence"])
+        self.assertEqual(len(public["last_observation"]["digest"]), 16)
 
     def test_crash_leaves_tmp_without_corrupting_state(self) -> None:
         self.store.save(RunnerState(run_id="good", sequence=4))

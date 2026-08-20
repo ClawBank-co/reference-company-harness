@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from harness.decide import (
+    ProbeCompleter,
     current_cash,
     decide,
     flat_forecasts,
@@ -96,3 +97,23 @@ class DecideTests(unittest.TestCase):
         )
         self.assertIsNone(error)
         self.assertEqual(decision["tool"], "set_prices")
+
+    def test_probe_completer_acts_then_advances(self) -> None:
+        catalog = [{"name": "get_cost_info", "input_schema": {"type": "object"}}]
+        completer = ProbeCompleter()
+        first, err1 = decide(
+            completer,
+            catalog=catalog,
+            observation={"data": {"cash": 1_000_000}},
+        )
+        second, err2 = decide(
+            completer,
+            catalog=catalog,
+            observation={"data": {"cash": 999_000}},
+        )
+        self.assertIsNone(err1)
+        self.assertEqual(first["action"], "tool")
+        self.assertEqual(first["tool"], "get_cost_info")
+        self.assertIsNone(err2)
+        self.assertEqual(second["action"], "advance")
+        self.assertEqual(second["forecasts"][0]["point"], 999_000.0)
