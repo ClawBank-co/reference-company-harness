@@ -65,3 +65,15 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(loaded.pending.idempotency_key, "advance-abc")
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(raw["pending"]["kind"], "advance")
+
+    def test_company_log_and_last_cash_round_trip(self) -> None:
+        self.store.save(
+            RunnerState(
+                last_cash=980_000.0,
+                company_log=["day=7 cash=980000 delta=-20000 last=set_prices"],
+            )
+        )
+        loaded = self.store.load()
+        assert loaded is not None
+        self.assertEqual(loaded.last_cash, 980_000.0)
+        self.assertEqual(loaded.company_log[0].startswith("day=7"), True)

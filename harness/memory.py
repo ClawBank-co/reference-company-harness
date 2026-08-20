@@ -39,6 +39,8 @@ class RunnerState:
     elapsed_s: float = 0.0
     forecast_fallback: bool = False
     notes: list[str] = field(default_factory=list)
+    company_log: list[str] = field(default_factory=list)
+    last_cash: float | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         payload = asdict(self)

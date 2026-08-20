@@ -59,6 +59,7 @@ class DecideTests(unittest.TestCase):
         self.assertIn("Fenced tools count", SYSTEM_PROMPT)
         self.assertIn("Call get_cost_info before mutations", SYSTEM_PROMPT)
         self.assertIn('"arguments"', SYSTEM_PROMPT)
+        self.assertIn("cut advertising", SYSTEM_PROMPT)
 
     def test_validate_args_table(self) -> None:
         schema = CATALOG[0]["input_schema"]
@@ -374,6 +375,38 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(parsed["action"], "tool")
         self.assertEqual(parsed["tool"], "set_prices")
         self.assertEqual(parsed["args"], {"price_a": 22})
+
+    def test_company_log_and_falling_cash_reach_the_prompt(self) -> None:
+        messages = build_messages(
+            catalog=[{"name": "get_cost_info"}],
+            observation={"data": {"cash": 900000}},
+            last_action_result={
+                "results": [{"tool": "get_cost_info", "success": True, "output": "ok"}]
+            },
+            company_log=["day=7 cash=980000 delta=-20000 last=set_targeted_ad_spend"],
+            cash_falling=True,
+        )
+        user = json.loads(messages[1]["content"])
+        self.assertEqual(user["company_log"][0].split()[0], "day=7")
+        self.assertTrue(
+            any("cash fell" in item["content"] for item in messages if item["role"] == "user")
+        )
+
+    def test_raw_cadence_allows_first_week_mutation(self) -> None:
+        catalog = [
+            {"name": "get_cost_info", "input_schema": {"type": "object"}},
+            CATALOG[0],
+        ]
+        decision, error = decide(
+            ScriptedCompleter(
+                ['{"action":"tool","tool":"set_prices","args":{"price_a": 22}}']
+            ),
+            catalog=catalog,
+            observation={"data": {}},
+            cadence="raw",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(decision["tool"], "set_prices")
 
     def test_valid_tool_decision(self) -> None:
         completer = ScriptedCompleter(

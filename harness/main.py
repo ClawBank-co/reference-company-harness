@@ -32,6 +32,7 @@ from harness.decide import (
 )
 from harness.fence import Fence, FenceBlock
 from harness.memory import PendingMutation, RunnerState, StateStore
+from harness.policy import apply_runway, cash_fell, trim_log, week_note
 from harness.trajectory import Trajectory
 
 SCENARIOS = {
@@ -53,6 +54,12 @@ PROBE_MANIFEST = {
     **MANIFEST,
     "name": "protocol-probe",
     "models": ["protocol-probe"],
+}
+
+THIN_MANIFEST = {
+    **MANIFEST,
+    "name": "thin-model",
+    "framework": "thin-model",
 }
 
 TERMINAL = frozenset({"completed", "bankrupt"})
@@ -86,10 +93,12 @@ def load_config(path: Path) -> dict[str, Any]:
         model["api_key_file"] = str(value if value.is_absolute() else root / value)
     raw_scenario = str(config.get("scenario", "conformance"))
     config["scenario_id"] = SCENARIOS.get(raw_scenario, raw_scenario)
+    rung = str(config.get("rung") or "reference").strip().lower()
+    config["rung"] = "raw" if rung == "raw" else "reference"
     return config
 
 
-def _tools_since_advance(notes: list[str]) -> int:
+def _tools_since_advance(notes: list[str], *, cadence: str = "reference") -> int:
     """Cadence pressure since the last advance.
 
     Mutating tools count toward the 3-tool advance cap. Inspect tools
@@ -112,6 +121,8 @@ def _tools_since_advance(notes: list[str]) -> int:
         tool = note.split(":", 1)[1]
         if not tool.startswith("get_"):
             mutations += 1
+    if cadence == "raw":
+        return total
     if total >= 6:
         return 3
     return mutations
@@ -174,6 +185,9 @@ class Runner:
         self.state.elapsed_s += self.clock.monotonic() - self._loop_started
         self._loop_started = self.clock.monotonic()
         self.store.save(self.state)
+
+    def _cadence(self) -> str:
+        return "raw" if self.config.get("rung") == "raw" else "reference"
 
     def authenticate(self) -> None:
         try:
@@ -487,6 +501,20 @@ class Runner:
                 self.persist()
                 return
             self.state.last_observation = result
+            cash = current_cash(result)
+            if self._cadence() == "reference":
+                self.state.company_log = trim_log(
+                    [
+                        *self.state.company_log,
+                        week_note(
+                            day=self.state.simulated_day,
+                            cash=cash,
+                            last_cash=self.state.last_cash,
+                            last_tool=self.state.last_tool,
+                        ),
+                    ]
+                )
+            self.state.last_cash = cash
             self.trajectory.append(
                 "advance",
                 step=self.state.step,
@@ -599,22 +627,37 @@ class Runner:
         self.client.fence.set_allowlist(
             [item["name"] for item in catalog if "name" in item]
         )
+        cash = current_cash(observation)
+        falling = cash_fell(cash, self.state.last_cash)
+        cadence = self._cadence()
         decision, repair = decide(
             self.completer,
             catalog=catalog,
             observation=observation,
             last_action_result=self.state.last_action_result,
-            tools_since_advance=_tools_since_advance(self.state.notes),
+            tools_since_advance=_tools_since_advance(
+                self.state.notes, cadence=cadence
+            ),
+            company_log=self.state.company_log if cadence == "reference" else None,
+            cash_falling=falling and cadence == "reference",
+            cadence=cadence,
         )
+        policy_note = None
+        if cadence == "reference":
+            decision, policy_note = apply_runway(
+                decision, cash=cash, last_cash=self.state.last_cash
+            )
         self.state.step += 1
         self.state.forecast_fallback = repair is not None
+        if policy_note:
+            self.state.notes.append(policy_note)
         self.trajectory.append(
             "decide",
             step=self.state.step,
             observation_digest=_digest(observation),
             action=decision.get("action"),
             tool=decision.get("tool"),
-            validation=repair or "ok",
+            validation=policy_note or repair or "ok",
             forecast_fallback=repair is not None,
         )
         if decision.get("action") == "tool":
@@ -1025,7 +1068,9 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
     state_dir = Path(config["state_dir"])
     model = config.get("model") or {}
     provider_url = str(model.get("provider_url") or "")
-    manifest = MANIFEST
+    cadence = str(config.get("rung") or "reference")
+    base_manifest = THIN_MANIFEST if cadence == "raw" else MANIFEST
+    manifest = base_manifest
     if completer is None:
         if provider_url == "probe://local":
             completer = ProbeCompleter()
@@ -1043,7 +1088,7 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
     if isinstance(completer, ProbeCompleter) or provider_url == "probe://local":
         manifest = PROBE_MANIFEST
     elif model.get("name"):
-        manifest = {**MANIFEST, "models": [str(model["name"])]}
+        manifest = {**base_manifest, "models": [str(model["name"])]}
     return Runner(
         config=config,
         store=StateStore(state_dir / "state.json"),

@@ -2697,6 +2697,10 @@ class ToolsSinceAdvanceTests(unittest.TestCase):
             3,
         )
         self.assertEqual(
+            _tools_since_advance(["acted:get_cost_info"] * 6, cadence="raw"),
+            6,
+        )
+        self.assertEqual(
             _tools_since_advance(["fence:send", "fence:trade", "fence:offramp"]),
             3,
         )

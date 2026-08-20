@@ -51,6 +51,25 @@ A week of only tool calls never moves time and never scores.
 
 The gym documents tools as {"tool":"<name>","arguments":{...}}. That is the same as
 {"action":"tool","tool":"<name>","args":{...}}. Do not put a catalog name in "action".
+If last week's cash fell, cut advertising. Buying ads into a down week bankrupts the firm.
+"""
+
+RAW_SYSTEM_PROMPT = """You operate Acme AI on ClawBank Business Bench. Maximize cash. Bankruptcy (cash < 0) ends the run.
+
+Talk to the hosted gym over REST. Use only the injected catalog. Time moves only with action=advance.
+
+Return ONE JSON object, no markdown:
+
+{"action":"tool","tool":"<catalog name>","args":{...}}
+{"action":"advance","rationale":"<non-empty strategy>","forecasts":[
+  {"horizon_days":7,"point":0,"lower":0,"upper":0},
+  {"horizon_days":28,"point":0,"lower":0,"upper":0},
+  {"horizon_days":84,"point":0,"lower":0,"upper":0},
+  {"horizon_days":182,"point":0,"lower":0,"upper":0}
+]}
+
+Forecast horizons must be 7, 28, 84, 182. Never call send, trade, or offramp.
+This is the thin rung: no company policy, no weekly memory, no ad cap.
 """
 
 
@@ -560,6 +579,9 @@ def build_messages(
     last_action_result: dict[str, Any] | None,
     repair: str | None = None,
     tools_since_advance: int = 0,
+    company_log: list[str] | None = None,
+    cash_falling: bool = False,
+    cadence: str = "reference",
 ) -> list[dict[str, str]]:
     user = {
         "observation": ensure_observation_clock(sanitize_hosted_payload(observation)),
@@ -567,14 +589,17 @@ def build_messages(
         "tools": sanitize_catalog(catalog),
         "tools_since_advance": tools_since_advance,
     }
+    if cadence == "reference" and company_log:
+        user["company_log"] = list(company_log)
+    prompt = RAW_SYSTEM_PROMPT if cadence == "raw" else SYSTEM_PROMPT
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": json.dumps(user, default=str)},
     ]
     catalog_names = {
         item["name"] for item in catalog if isinstance(item.get("name"), str)
     }
-    if needs_inspect(
+    if cadence == "reference" and needs_inspect(
         catalog_names=catalog_names,
         last_action_result=last_action_result,
         tools_since_advance=tools_since_advance,
@@ -588,13 +613,23 @@ def build_messages(
                 ),
             }
         )
-    if tools_since_advance >= 3:
+    advance_after = 3 if cadence == "reference" else 12
+    if tools_since_advance >= advance_after:
         messages.append(
             {
                 "role": "user",
                 "content": (
-                    "You already used 3 mutating tools or 6 tools since the last "
-                    "advance. Return action=advance with cash forecasts. Do not call a tool."
+                    "Return action=advance with cash forecasts. Do not call a tool."
+                ),
+            }
+        )
+    if cadence == "reference" and cash_falling:
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Last week cash fell. Cut advertising. Do not raise "
+                    "set_targeted_ad_spend. Change prices or capacity, or advance."
                 ),
             }
         )
@@ -610,13 +645,17 @@ def decide(
     observation: dict[str, Any],
     last_action_result: dict[str, Any] | None = None,
     tools_since_advance: int = 0,
+    company_log: list[str] | None = None,
+    cash_falling: bool = False,
+    cadence: str = "reference",
 ) -> tuple[dict[str, Any], str | None]:
     """Parse one model decision. Second failure keeps an intended catalog tool."""
     tools = {item["name"]: item for item in catalog if "name" in item}
     error: str | None = None
     parsed: dict[str, Any] | None = None
-    must_advance = tools_since_advance >= 3
-    inspect_first = needs_inspect(
+    advance_after = 3 if cadence == "reference" else 12
+    must_advance = tools_since_advance >= advance_after
+    inspect_first = cadence == "reference" and needs_inspect(
         catalog_names=set(tools),
         last_action_result=last_action_result,
         tools_since_advance=tools_since_advance,
@@ -628,6 +667,9 @@ def decide(
             last_action_result=last_action_result,
             repair=error,
             tools_since_advance=tools_since_advance,
+            company_log=company_log,
+            cash_falling=cash_falling,
+            cadence=cadence,
         )
         raw = completer.complete(messages)
         try:

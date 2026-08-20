@@ -42,7 +42,7 @@ harness/trajectory.py JSONL events, no keys or model prose
 
 ## 4. Out of scope
 
-Memory retrieval, planning, subagents, reflection, forecast sandbox, strategy retry, per-model prompts.
+Memory retrieval, planning, subagents, reflection, forecast sandbox, strategy retry, per-model prompts. A short append-only week log and a runway fence that clears ads after a down week are in scope for the reference rung. The `raw` rung disables those.
 
 ## 5. Process
 

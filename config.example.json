@@ -19,6 +19,7 @@
     "max_attempts": 6
   },
   "scenario": "conformance",
+  "rung": "reference",
   "track": "practice",
   "file_terminal_ticket": true
 }

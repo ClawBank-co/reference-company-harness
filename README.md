@@ -6,6 +6,8 @@ Cite results by commit hash. Spec: [`SPEC.md`](SPEC.md). Host contract: `GET /v1
 
 This is not `saas_bench.reference_runner`. That module is a protocol stub with canned actions. This repo calls a model.
 
+`rung` in config is `reference` (default) or `raw` (thin model, no week log / runway / inspect-first).
+
 Out of scope: memory retrieval, planning, subagents, a forecast calculator, per-model prompts. Put those in a different harness.
 
 ## Setup
