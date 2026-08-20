@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.harness-run/
+state.json
+state.json.tmp
+*.hex
+config.json
+.env
+trajectory.jsonl
+.DS_Store
