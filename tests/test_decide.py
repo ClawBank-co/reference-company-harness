@@ -15,6 +15,7 @@ from harness.decide import (
     current_cash,
     decide,
     flat_forecasts,
+    normalize_decision,
     parse_json_object,
     payload_leaks_local_protocol,
     published_tools,
@@ -57,6 +58,7 @@ class DecideTests(unittest.TestCase):
         self.assertIn("mutating tools", SYSTEM_PROMPT)
         self.assertIn("Fenced tools count", SYSTEM_PROMPT)
         self.assertIn("Call get_cost_info before mutations", SYSTEM_PROMPT)
+        self.assertIn('"arguments"', SYSTEM_PROMPT)
 
     def test_validate_args_table(self) -> None:
         schema = CATALOG[0]["input_schema"]
@@ -305,6 +307,73 @@ class DecideTests(unittest.TestCase):
         )
         self.assertIsNone(error)
         self.assertEqual(decision["tool"], "set_prices")
+
+    def test_gym_example_call_is_a_tool_after_inspect(self) -> None:
+        catalog = [
+            {"name": "get_cost_info", "input_schema": {"type": "object"}},
+            CATALOG[0],
+        ]
+        inspected = {
+            "results": [{"tool": "get_cost_info", "success": True, "output": "ok"}]
+        }
+        cases = [
+            {"tool": "set_prices", "arguments": {"price_a": 22}},
+            {"action": "set_prices", "arguments": {"price_a": 22}},
+            {"action": "set_prices", "price_a": 22},
+            {"set_prices": {"price_a": 22}},
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "set_prices",
+                            "arguments": '{"price_a": 22}',
+                        }
+                    }
+                ]
+            },
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                decision, error = decide(
+                    ScriptedCompleter([json.dumps(payload)]),
+                    catalog=catalog,
+                    observation={"data": {}},
+                    last_action_result=inspected,
+                )
+                self.assertIsNone(error, payload)
+                self.assertEqual(decision["action"], "tool")
+                self.assertEqual(decision["tool"], "set_prices")
+                self.assertEqual(decision["args"], {"price_a": 22})
+
+    def test_near_miss_mutation_is_not_replaced_with_cost_info(self) -> None:
+        catalog = [
+            {"name": "get_cost_info", "input_schema": {"type": "object"}},
+            CATALOG[0],
+        ]
+        completer = ScriptedCompleter(
+            [
+                '{"action":"set_prices","args":{"price_a":"22"}}',
+                '{"action":"set_prices","args":{"price_a":"23"}}',
+            ]
+        )
+        decision, error = decide(
+            completer,
+            catalog=catalog,
+            observation={"data": {}},
+            last_action_result={
+                "results": [{"tool": "get_cost_info", "success": True, "output": "ok"}]
+            },
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(decision["tool"], "set_prices")
+        self.assertEqual(decision["args"], {"price_a": "23"})
+
+    def test_normalize_decision_maps_catalog_action(self) -> None:
+        parsed = {"action": "set_prices", "arguments": {"price_a": 22}}
+        normalize_decision(parsed, {item["name"]: item for item in CATALOG})
+        self.assertEqual(parsed["action"], "tool")
+        self.assertEqual(parsed["tool"], "set_prices")
+        self.assertEqual(parsed["args"], {"price_a": 22})
 
     def test_valid_tool_decision(self) -> None:
         completer = ScriptedCompleter(

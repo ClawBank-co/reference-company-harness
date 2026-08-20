@@ -48,6 +48,9 @@ Call get_cost_info before mutations or advance. Other get_* tools do not count a
 After at most 3 mutating tools since the last advance, you MUST action=advance.
 Six tools of any kind in one week also require advance. Fenced tools count.
 A week of only tool calls never moves time and never scores.
+
+The gym documents tools as {"tool":"<name>","arguments":{...}}. That is the same as
+{"action":"tool","tool":"<name>","args":{...}}. Do not put a catalog name in "action".
 """
 
 
@@ -348,6 +351,143 @@ def sanitize_catalog(catalog: Any) -> list[dict[str, Any]]:
     return cleaned
 
 
+_RESERVED_DECISION_KEYS = frozenset(
+    {
+        "action",
+        "args",
+        "arguments",
+        "comment",
+        "forecasts",
+        "name",
+        "rationale",
+        "reasoning",
+        "thought",
+        "tool",
+        "tool_calls",
+    }
+)
+
+
+def _as_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _catalog_name(name: Any, tools: dict[str, dict[str, Any]]) -> str | None:
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if name in tools:
+        return name
+    lowered = {key.lower(): key for key in tools}
+    return lowered.get(name.strip().lower())
+
+
+def _tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    schema = tool.get("input_schema") or tool.get("inputSchema")
+    return schema if isinstance(schema, dict) else {"type": "object"}
+
+
+def _hoist_schema_args(parsed: dict[str, Any], tools: dict[str, dict[str, Any]]) -> None:
+    name = _catalog_name(parsed.get("tool"), tools)
+    if name is None:
+        return
+    properties = _tool_schema(tools[name]).get("properties")
+    if not isinstance(properties, dict):
+        return
+    args = parsed.get("args")
+    if not isinstance(args, dict):
+        args = {}
+        parsed["args"] = args
+    for key, value in list(parsed.items()):
+        if key in _RESERVED_DECISION_KEYS or key not in properties or key in args:
+            continue
+        args[key] = value
+
+
+def normalize_decision(
+    parsed: dict[str, Any], tools: dict[str, dict[str, Any]]
+) -> None:
+    """Accept gym example_call and function-call shapes as action=tool."""
+    if (
+        parsed.get("action") is None
+        and parsed.get("tool") is None
+        and parsed.get("forecasts") is None
+        and parsed.get("name") is None
+        and parsed.get("tool_calls") is None
+    ):
+        catalog_keys = [
+            key for key in parsed if _catalog_name(key, tools) is not None
+        ]
+        if len(catalog_keys) == 1:
+            name = _catalog_name(catalog_keys[0], tools)
+            payload = _as_object(parsed.get(catalog_keys[0]))
+            parsed["action"] = "tool"
+            parsed["tool"] = name
+            if payload is not None:
+                parsed["args"] = payload
+
+    calls = parsed.get("tool_calls")
+    if isinstance(calls, list) and calls and isinstance(calls[0], dict):
+        first = calls[0]
+        fn = first.get("function") if isinstance(first.get("function"), dict) else first
+        name = _catalog_name(fn.get("name") if isinstance(fn, dict) else None, tools)
+        if name is not None:
+            parsed["action"] = "tool"
+            parsed["tool"] = name
+            args = _as_object(
+                (fn.get("arguments") if isinstance(fn, dict) else None)
+                or (fn.get("args") if isinstance(fn, dict) else None)
+            )
+            if args is not None:
+                parsed["args"] = args
+
+    if "args" not in parsed or parsed.get("args") in (None, {}):
+        args = _as_object(parsed.get("arguments"))
+        if args is None:
+            args = _as_object(parsed.get("args"))
+        if args is not None:
+            parsed["args"] = args
+
+    named = _catalog_name(parsed.get("name"), tools)
+    if named is not None:
+        parsed.setdefault("tool", named)
+
+    action = parsed.get("action")
+    if isinstance(action, str):
+        stripped = action.strip()
+        catalog = _catalog_name(stripped, tools)
+        if catalog is not None:
+            parsed.setdefault("tool", catalog)
+            parsed["action"] = "tool"
+        else:
+            parsed["action"] = stripped.lower()
+
+    if parsed.get("tool") and not isinstance(parsed.get("args"), dict):
+        parsed["args"] = {}
+
+    if parsed.get("action") not in {"tool", "advance"}:
+        if _catalog_name(parsed.get("tool"), tools) is not None:
+            parsed["action"] = "tool"
+        elif parsed.get("forecasts") is not None:
+            parsed["action"] = "advance"
+
+    if parsed.get("action") == "tool":
+        catalog = _catalog_name(parsed.get("tool"), tools)
+        if catalog is not None:
+            parsed["tool"] = catalog
+        _hoist_schema_args(parsed, tools)
+
+
 def last_action_tool(result: dict[str, Any] | None) -> str | None:
     if not isinstance(result, dict):
         return None
@@ -471,7 +611,7 @@ def decide(
     last_action_result: dict[str, Any] | None = None,
     tools_since_advance: int = 0,
 ) -> tuple[dict[str, Any], str | None]:
-    """Parse one model decision. Second failure → inspect or flat-forecast advance."""
+    """Parse one model decision. Second failure keeps an intended catalog tool."""
     tools = {item["name"]: item for item in catalog if "name" in item}
     error: str | None = None
     parsed: dict[str, Any] | None = None
@@ -516,6 +656,21 @@ def decide(
             },
             error or "must_advance",
         )
+    intended = (
+        parsed.get("tool")
+        if isinstance(parsed, dict) and parsed.get("action") == "tool"
+        else None
+    )
+    if (
+        intended in tools
+        and not inspect_first
+        and intended != "get_cost_info"
+    ):
+        args = parsed.get("args") if isinstance(parsed.get("args"), dict) else {}
+        return (
+            {"action": "tool", "tool": intended, "args": args},
+            error or "invalid_model_output",
+        )
     if "get_cost_info" in tools:
         return (
             {"action": "tool", "tool": "get_cost_info", "args": {}},
@@ -529,20 +684,8 @@ def decide(
     return fallback, error or "invalid_model_output"
 
 
-def _normalize_action(parsed: dict[str, Any]) -> None:
-    action = parsed.get("action")
-    if isinstance(action, str):
-        parsed["action"] = action.strip().lower()
-        return
-    if parsed.get("tool"):
-        parsed["action"] = "tool"
-        return
-    if parsed.get("forecasts") is not None:
-        parsed["action"] = "advance"
-
-
 def _check_decision(parsed: dict[str, Any], tools: dict[str, dict[str, Any]]) -> str | None:
-    _normalize_action(parsed)
+    normalize_decision(parsed, tools)
     action = parsed.get("action")
     if action == "advance":
         rationale = parsed.get("rationale")
@@ -553,6 +696,5 @@ def _check_decision(parsed: dict[str, Any], tools: dict[str, dict[str, Any]]) ->
         name = parsed.get("tool")
         if not isinstance(name, str) or name not in tools:
             return f"unknown tool {name!r}"
-        schema = tools[name].get("input_schema") or {"type": "object"}
-        return validate_args(schema, parsed.get("args", {}))
+        return validate_args(_tool_schema(tools[name]), parsed.get("args", {}))
     return f"action must be 'tool' or 'advance', got {action!r}"
