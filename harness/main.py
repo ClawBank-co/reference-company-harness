@@ -515,6 +515,14 @@ class Runner:
                     ]
                 )
             self.state.last_cash = cash
+            print(
+                f"week {self.state.simulated_day // 7}  "
+                f"day {self.state.simulated_day}  "
+                f"cash ${int(round(cash)):,}  "
+                f"step {self.state.step}  "
+                f"{self._cadence()}",
+                flush=True,
+            )
             self.trajectory.append(
                 "advance",
                 step=self.state.step,

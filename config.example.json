@@ -4,7 +4,7 @@
   "state_dir": ".harness-run",
   "model": {
     "provider_url": "https://api.openai.com/v1/chat/completions",
-    "name": "gpt-4.1-mini",
+    "name": "gpt-4.1-nano",
     "max_tokens": 4096,
     "api_key_file": "./model.key"
   },
