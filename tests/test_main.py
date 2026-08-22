@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import os
 import tempfile
 from typing import Any
 import unittest
@@ -12,7 +14,13 @@ from eth_account import Account
 from harness.client import BenchmarkClient, ConflictError, TransportResponse
 from harness.fence import Fence
 from harness.decide import ProbeCompleter
-from harness.main import Runner, _tools_since_advance
+from harness.main import (
+    SWEEP_WALLET_ADDRESS,
+    Runner,
+    _tools_since_advance,
+    build_runner,
+    load_config,
+)
 from harness.memory import PendingMutation, RunnerState, StateStore
 from harness.trajectory import Trajectory
 
@@ -2655,6 +2663,210 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(loaded.phase, "terminal")
         self.assertEqual(loaded.status, "failed")
         self.assertIn("rejected:auth", loaded.notes)
+
+    def _sweep_runner(
+        self, transport: ScriptedTransport, *, token: str = "sweep-token-for-tests"
+    ) -> tuple[Runner, StateStore, Path]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        token_file = Path(tmp.name) / "sweep.token"
+        token_file.write_text(token, encoding="utf-8")
+        store = StateStore(Path(tmp.name) / "state.json")
+        store.save(RunnerState(phase="new"))
+        client = BenchmarkClient(
+            transport,
+            fence=Fence(),
+            get_access_token=lambda: None,
+            reauthenticate=lambda: None,
+            sleeper=lambda _: None,
+        )
+        runner = Runner(
+            config={
+                "scenario_id": "business-bench-growth-short-v0",
+                "rung": "raw",
+                "auth": {"mode": "sweep", "token_file": str(token_file)},
+                "budgets": {"max_steps": 10},
+            },
+            store=store,
+            client=client,
+            completer=lambda messages: "",
+            trajectory=Trajectory(Path(tmp.name) / "trajectory.jsonl"),
+            clock=Clock(),
+        )
+        client._get_access_token = lambda: runner.state.access_token
+        client._reauthenticate = runner.authenticate
+        return runner, store, token_file
+
+    def test_sweep_authenticate_reads_env_token_without_siwe(self) -> None:
+        transport = ScriptedTransport([])
+        previous = os.environ.get("BENCH_SWEEP_TOKEN")
+        os.environ["BENCH_SWEEP_TOKEN"] = "sweep-token-from-env-file"
+        self.addCleanup(
+            lambda: (
+                os.environ.__setitem__("BENCH_SWEEP_TOKEN", previous)
+                if previous is not None
+                else os.environ.pop("BENCH_SWEEP_TOKEN", None)
+            )
+        )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = StateStore(Path(tmp.name) / "state.json")
+        store.save(RunnerState(phase="new"))
+        client = BenchmarkClient(
+            transport,
+            fence=Fence(),
+            get_access_token=lambda: None,
+            reauthenticate=lambda: None,
+            sleeper=lambda _: None,
+        )
+        runner = Runner(
+            config={
+                "scenario_id": "business-bench-growth-short-v0",
+                "rung": "raw",
+                "auth": {"mode": "sweep"},
+                "budgets": {"max_steps": 10},
+            },
+            store=store,
+            client=client,
+            completer=lambda messages: "",
+            trajectory=Trajectory(Path(tmp.name) / "trajectory.jsonl"),
+            clock=Clock(),
+        )
+        client._get_access_token = lambda: runner.state.access_token
+        client._reauthenticate = runner.authenticate
+        runner.authenticate()
+        loaded = store.load()
+        assert loaded is not None
+        self.assertEqual(loaded.access_token, "sweep-token-from-env-file")
+        self.assertEqual(loaded.wallet_address, SWEEP_WALLET_ADDRESS)
+        self.assertEqual(transport.calls, [])
+
+    def test_sweep_authenticate_reads_token_file_without_siwe(self) -> None:
+        transport = ScriptedTransport([])
+        runner, store, _token_file = self._sweep_runner(transport)
+        runner.authenticate()
+        loaded = store.load()
+        assert loaded is not None
+        self.assertEqual(loaded.phase, "authenticated")
+        self.assertEqual(loaded.access_token, "sweep-token-for-tests")
+        self.assertEqual(loaded.wallet_address, SWEEP_WALLET_ADDRESS)
+        self.assertIn("authenticated", loaded.notes)
+        self.assertEqual(transport.calls, [])
+
+    def test_sweep_401_rereads_token_and_does_not_try_siwe(self) -> None:
+        transport = ScriptedTransport(
+            [
+                TransportResponse(401, {"detail": "missing_bearer_token"}, "denied"),
+                TransportResponse(
+                    200,
+                    {"sequence": 1, "simulated_day": 0, "status": "running"},
+                    "ok",
+                ),
+            ]
+        )
+        runner, store, token_file = self._sweep_runner(transport)
+        runner.authenticate()
+        token_file.write_text("rotated-sweep-token", encoding="utf-8")
+        body = runner.client.get_observation("run_sweep")
+        self.assertEqual(body["status"], "running")
+        self.assertEqual(
+            [path for _method, path in transport.calls],
+            ["/v1/runs/run_sweep/observation", "/v1/runs/run_sweep/observation"],
+        )
+        loaded = store.load()
+        assert loaded is not None
+        self.assertEqual(loaded.access_token, "rotated-sweep-token")
+
+
+class LoadConfigTests(unittest.TestCase):
+    def test_load_config_allows_sweep_without_token_file(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "host": "https://bench.clawbank.co",
+                    "state_dir": "./state",
+                    "rung": "raw",
+                    "scenario": "growth",
+                    "auth": {"mode": "sweep"},
+                    "model": {"name": "gpt-4.1-nano"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = load_config(path)
+        self.assertEqual(config["rung"], "raw")
+        self.assertEqual(config["auth"]["mode"], "sweep")
+        self.assertNotIn("token_file", config["auth"])
+        self.assertEqual(config["scenario_id"], "business-bench-growth-short-v0")
+
+    def test_load_config_resolves_optional_sweep_token_file(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "host": "https://bench.clawbank.co",
+                    "state_dir": "./state",
+                    "rung": "raw",
+                    "auth": {"mode": "sweep", "token_file": "./sweep.token"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = load_config(path)
+        self.assertEqual(
+            Path(config["auth"]["token_file"]).resolve(),
+            (Path(tmp.name) / "sweep.token").resolve(),
+        )
+
+    def test_load_config_rejects_sweep_on_reference_rung(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "host": "https://bench.clawbank.co",
+                    "rung": "reference",
+                    "auth": {"mode": "sweep", "token_file": "./sweep.token"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError) as raised:
+            load_config(path)
+        self.assertIn("raw", str(raised.exception))
+
+    def test_build_runner_sweep_does_not_require_wallet_key(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        token_file = Path(tmp.name) / "sweep.token"
+        token_file.write_text("sweep-token-for-tests", encoding="utf-8")
+        path = Path(tmp.name) / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "host": "https://bench.clawbank.co",
+                    "state_dir": "./state",
+                    "rung": "raw",
+                    "scenario": "growth",
+                    "auth": {"mode": "sweep", "token_file": "./sweep.token"},
+                    "model": {
+                        "name": "gpt-4.1-nano",
+                        "provider_url": "https://api.openai.com/v1/chat/completions",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        runner = build_runner(load_config(path), completer=lambda messages: "")
+        self.assertIsNone(runner.signer)
+        self.assertEqual(runner.state.wallet_address, SWEEP_WALLET_ADDRESS)
+        self.assertEqual(runner.manifest["framework"], "thin-model")
 
 
 class ToolsSinceAdvanceTests(unittest.TestCase):

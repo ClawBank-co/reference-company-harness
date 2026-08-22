@@ -5,11 +5,24 @@ from __future__ import annotations
 import json
 import re
 import time
+from http.client import IncompleteRead
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 TRANSIENT_LLM_STATUS = frozenset({429, 502, 503, 504})
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _completion_headers(provider_url: str, api_key: str) -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if "openrouter.ai" in provider_url:
+        headers["HTTP-Referer"] = "https://bench.clawbank.co"
+        headers["X-Title"] = "reference-company-harness"
+    return headers
 
 HORIZONS = (7, 28, 84, 182)
 LOCAL_ONLY_TOOLS = frozenset(
@@ -139,10 +152,7 @@ class HttpCompleter:
             request = Request(
                 self.provider_url,
                 data=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                },
+                headers=_completion_headers(self.provider_url, self.api_key),
                 method="POST",
             )
             try:
@@ -161,6 +171,12 @@ class HttpCompleter:
                     self._sleeper(min(60.0, 2.0**attempt))
                     continue
                 raise RuntimeError(f"llm_transport: {exc.reason}") from exc
+            except IncompleteRead as exc:
+                last_error = exc
+                if attempt + 1 < self.retries:
+                    self._sleeper(min(60.0, 2.0**attempt))
+                    continue
+                raise RuntimeError("llm_incomplete_read") from exc
         if payload is None:
             raise RuntimeError("llm_retries_exhausted") from last_error
         choices = payload.get("choices") or []

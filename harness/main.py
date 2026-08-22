@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -64,6 +65,7 @@ THIN_MANIFEST = {
 
 TERMINAL = frozenset({"completed", "bankrupt"})
 STOPPED = frozenset({"cancelled", "failed"})
+SWEEP_WALLET_ADDRESS = "0x000000000000000000000000000000000000dEaD"
 
 
 def parse_observation_clock(payload: Any) -> tuple[int, int, str] | None:
@@ -80,7 +82,30 @@ def parse_observation_clock(payload: Any) -> tuple[int, int, str] | None:
     return sequence, simulated_day, status
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def load_project_env() -> None:
+    """Load repo-root .env without overwriting a real environment."""
+    path = _repo_root() / ".env"
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def load_config(path: Path) -> dict[str, Any]:
+    load_project_env()
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     root = Path(path).resolve().parent
     for key in ("wallet_key_file", "state_dir"):
@@ -95,7 +120,49 @@ def load_config(path: Path) -> dict[str, Any]:
     config["scenario_id"] = SCENARIOS.get(raw_scenario, raw_scenario)
     rung = str(config.get("rung") or "reference").strip().lower()
     config["rung"] = "raw" if rung == "raw" else "reference"
+    auth = config.get("auth")
+    if isinstance(auth, dict):
+        mode = str(auth.get("mode") or "siwe").strip().lower()
+        if mode not in {"siwe", "sweep"}:
+            raise ValueError("auth.mode must be 'siwe' or 'sweep'")
+        auth["mode"] = mode
+        if "token_file" in auth:
+            value = Path(auth["token_file"])
+            auth["token_file"] = str(value if value.is_absolute() else root / value)
+        config["auth"] = auth
+        if mode == "sweep" and config["rung"] != "raw":
+            raise ValueError("auth.mode=sweep is only allowed when rung is raw")
     return config
+
+
+def _model_api_key(model: dict[str, Any], provider_url: str) -> str:
+    if "openrouter.ai" in provider_url:
+        env_names = ("OPENROUTER_API_KEY",)
+        needed = "OPENROUTER_API_KEY"
+    else:
+        env_names = ("OPENAI_API_KEY",)
+        needed = "OPENAI_API_KEY or model.api_key_file"
+    for name in env_names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    if "openrouter.ai" not in provider_url:
+        key_file = model.get("api_key_file")
+        if key_file:
+            return Path(key_file).read_text(encoding="utf-8").strip()
+    raise ValueError(f"{needed} is required")
+
+
+def _sweep_token(config: dict[str, Any]) -> str | None:
+    token_file = (config.get("auth") or {}).get("token_file")
+    if isinstance(token_file, str) and token_file:
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return token or None
+    token = (os.environ.get("BENCH_SWEEP_TOKEN") or "").strip()
+    return token or None
 
 
 def _tools_since_advance(notes: list[str], *, cadence: str = "reference") -> int:
@@ -143,7 +210,7 @@ class Runner:
         *,
         config: dict[str, Any],
         store: StateStore,
-        signer: LocalSigner,
+        signer: LocalSigner | None = None,
         completer: Any,
         trajectory: Trajectory,
         client: BenchmarkClient | None = None,
@@ -165,11 +232,16 @@ class Runner:
             self.manifest = MANIFEST
         self.trajectory = trajectory
         self.clock = clock
+        wallet = (
+            SWEEP_WALLET_ADDRESS
+            if self._auth_mode() == "sweep" or signer is None
+            else signer.address
+        )
         self.state = store.load() or RunnerState(
             scenario_id=config["scenario_id"],
-            wallet_address=signer.address,
+            wallet_address=wallet,
         )
-        self.state.wallet_address = signer.address
+        self.state.wallet_address = wallet
         self.state.scenario_id = config["scenario_id"]
         self._loop_started = clock.monotonic()
         self._unusable_run_ids: set[str] = set()
@@ -189,7 +261,16 @@ class Runner:
     def _cadence(self) -> str:
         return "raw" if self.config.get("rung") == "raw" else "reference"
 
+    def _auth_mode(self) -> str:
+        return str((self.config.get("auth") or {}).get("mode") or "siwe").strip().lower()
+
     def authenticate(self) -> None:
+        if self._auth_mode() == "sweep":
+            self._authenticate_sweep()
+            return
+        if self.signer is None:
+            self._fail_auth()
+            return
         try:
             challenge = self.client.create_challenge(self.signer.address)
         except BenchmarkError:
@@ -217,6 +298,20 @@ class Runner:
         if not self._apply_session(token):
             self._fail_auth()
 
+    def _authenticate_sweep(self) -> None:
+        token = _sweep_token(self.config)
+        if not token:
+            self._fail_auth()
+            return
+        self.state.access_token = token
+        self.state.wallet_address = SWEEP_WALLET_ADDRESS
+        self.state.token_expires_at = None
+        if self.state.phase == "new":
+            self.state.phase = "authenticated"
+        self.state.notes.append("authenticated")
+        self.trajectory.append("auth", step=self.state.step)
+        self.persist()
+
     def _apply_session(self, token: Any) -> bool:
         if not isinstance(token, dict):
             return False
@@ -230,8 +325,11 @@ class Runner:
         wallet = None
         if isinstance(participant, dict):
             wallet = participant.get("wallet_address")
+        fallback = (
+            self.signer.address if self.signer is not None else SWEEP_WALLET_ADDRESS
+        )
         self.state.wallet_address = (
-            wallet if isinstance(wallet, str) and wallet else self.signer.address
+            wallet if isinstance(wallet, str) and wallet else fallback
         )
         if self.state.phase == "new":
             self.state.phase = "authenticated"
@@ -1083,7 +1181,7 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
         if provider_url == "probe://local":
             completer = ProbeCompleter()
         else:
-            api_key = Path(model["api_key_file"]).read_text(encoding="utf-8").strip()
+            api_key = _model_api_key(model, provider_url)
             completer = HttpCompleter(
                 provider_url=provider_url,
                 model=model["name"],
@@ -1097,10 +1195,16 @@ def build_runner(config: dict[str, Any], *, completer: Any | None = None) -> Run
         manifest = PROBE_MANIFEST
     elif model.get("name"):
         manifest = {**base_manifest, "models": [str(model["name"])]}
+    auth_mode = str((config.get("auth") or {}).get("mode") or "siwe").strip().lower()
+    signer = (
+        None
+        if auth_mode == "sweep"
+        else LocalSigner(Path(config["wallet_key_file"]))
+    )
     return Runner(
         config=config,
         store=StateStore(state_dir / "state.json"),
-        signer=LocalSigner(Path(config["wallet_key_file"])),
+        signer=signer,
         completer=completer,
         trajectory=Trajectory(state_dir / "trajectory.jsonl"),
         transport=UrllibTransport(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from http.client import IncompleteRead
 from io import BytesIO
 import json
 import unittest
@@ -489,3 +490,79 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(text, '{"action":"advance"}')
         self.assertEqual(opener.calls, 3)
         self.assertEqual(sleeps, [1.0, 2.0])
+
+    def test_http_completer_retries_incomplete_read(self) -> None:
+        class FlakyOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, request, timeout=None):
+                self.calls += 1
+                if self.calls < 3:
+                    raise IncompleteRead(b"")
+                payload = {
+                    "choices": [
+                        {"message": {"content": '{"action":"advance"}'}}
+                    ]
+                }
+
+                class _Response:
+                    def read(self_inner):
+                        return json.dumps(payload).encode("utf-8")
+
+                    def __enter__(self_inner):
+                        return self_inner
+
+                    def __exit__(self_inner, *args):
+                        return False
+
+                return _Response()
+
+        opener = FlakyOpener()
+        sleeps: list[float] = []
+        completer = HttpCompleter(
+            provider_url="https://example.test/v1/chat/completions",
+            model="gpt-4.1-nano",
+            api_key="sk-test",
+            opener=opener,
+            sleeper=sleeps.append,
+        )
+        text = completer.complete([{"role": "user", "content": "{}"}])
+        self.assertEqual(text, '{"action":"advance"}')
+        self.assertEqual(opener.calls, 3)
+        self.assertEqual(sleeps, [1.0, 2.0])
+
+    def test_http_completer_adds_openrouter_headers(self) -> None:
+        captured: dict[str, str] = {}
+
+        class Opener:
+            def __call__(self, request, timeout=None):
+                captured.update(request.headers)
+                payload = {
+                    "choices": [
+                        {"message": {"content": '{"action":"advance"}'}}
+                    ]
+                }
+
+                class _Response:
+                    def read(self_inner):
+                        return json.dumps(payload).encode("utf-8")
+
+                    def __enter__(self_inner):
+                        return self_inner
+
+                    def __exit__(self_inner, *args):
+                        return False
+
+                return _Response()
+
+        completer = HttpCompleter(
+            provider_url="https://openrouter.ai/api/v1/chat/completions",
+            model="openai/gpt-4.1-nano",
+            api_key="or-test",
+            opener=Opener(),
+        )
+        completer.complete([{"role": "user", "content": "{}"}])
+        self.assertEqual(captured.get("Authorization"), "Bearer or-test")
+        self.assertEqual(captured.get("Http-referer"), "https://bench.clawbank.co")
+        self.assertEqual(captured.get("X-title"), "reference-company-harness")

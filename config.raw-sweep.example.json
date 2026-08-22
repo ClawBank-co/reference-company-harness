@@ -1,7 +1,9 @@
 {
-  "host": "http://127.0.0.1:8000",
-  "wallet_key_file": "./key.hex",
-  "state_dir": ".harness-run",
+  "host": "https://bench.clawbank.co",
+  "state_dir": ".harness-run/sweep-raw-nano-28d",
+  "auth": {
+    "mode": "sweep"
+  },
   "model": {
     "provider_url": "https://openrouter.ai/api/v1/chat/completions",
     "name": "openai/gpt-4.1-nano",
@@ -17,8 +19,8 @@
     "cap_s": 60,
     "max_attempts": 6
   },
-  "scenario": "conformance",
-  "rung": "reference",
+  "scenario": "growth",
+  "rung": "raw",
   "track": "practice",
   "file_terminal_ticket": true
 }

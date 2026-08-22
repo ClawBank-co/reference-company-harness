@@ -10,6 +10,8 @@ state.json
 state.json.tmp
 *.hex
 config.json
+sweep.token
+*.token
 model.key
 .env
 trajectory.jsonl

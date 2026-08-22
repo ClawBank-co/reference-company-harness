@@ -19,9 +19,11 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 cp config.example.json config.json
+cp .env.example .env
 python -c 'from eth_account import Account; print(Account.create().key.hex())' > key.hex
-printf '%s\n' "$OPENAI_API_KEY" > model.key
 ```
+
+`.env` is gitignored. `OPENROUTER_API_KEY` is enough for the model. Change `model.name` to any OpenRouter slug. `model.key` still works if you point `provider_url` at OpenAI.
 
 `host` is `http://127.0.0.1:8000` or `https://bench.clawbank.co`. `scenario` is `conformance`, `growth`, or `full`.
 
