@@ -751,7 +751,10 @@ class Runner:
         policy_note = None
         if cadence == "reference":
             decision, policy_note = apply_runway(
-                decision, cash=cash, last_cash=self.state.last_cash
+                decision,
+                cash=cash,
+                last_cash=self.state.last_cash,
+                observation=observation,
             )
         self.state.step += 1
         self.state.forecast_fallback = repair is not None
