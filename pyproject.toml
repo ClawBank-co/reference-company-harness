@@ -1,7 +1,7 @@
 [project]
 name = "reference-company-harness"
 version = "0.1.0"
-description = "Minimal conforming baseline harness for ClawBank Business Bench."
+description = "The baseline company harness for ClawBank Business Bench — same model, same economy, 500 simulated days. The operating system is the variable."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"

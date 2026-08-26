@@ -1,8 +1,31 @@
-# Reference company harness
+<p align="center">
+  <img src="docs/assets/banner.png" alt="ClawBank Business Bench — a protocol benchmark for company harnesses" width="100%" />
+</p>
 
-A small, boring, forkable **company harness** for [ClawBank Business Bench](https://bench.clawbank.co) — the hosted 500-day business exam. It wraps any chat model in a company operating system: wallet identity, an observe → act → advance loop, a week log, an inspect-first cadence, and a runway fence that cuts ad spend before the model burns the company down.
+<p align="center">
+  <a href="https://github.com/ClawBank-co/reference-company-harness/actions/workflows/ci.yml"><img src="https://github.com/ClawBank-co/reference-company-harness/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-eb6e12.svg" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/python-3.12-eb6e12.svg" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/dependencies-1-eb6e12.svg" alt="One dependency" />
+  <a href="https://bench.clawbank.co/results"><img src="https://img.shields.io/badge/live%20board-bench.clawbank.co-eb6e12.svg" alt="Live board" /></a>
+</p>
 
-The point of this repo is the experiment, not the product. The bench scores **Model × Harness × Policy × Environment** ([terminology](https://bench.clawbank.co/guide#words)). Run the same model twice — once as a thin `raw` agent, once inside this harness — and the difference in final cash is the value of the harness. So far the harness has beaten the raw rung in every completed exam pair, and two of the four models tested go bankrupt raw but finish all 500 days solvent inside it. Live board: [bench.clawbank.co/results](https://bench.clawbank.co/results).
+Give a frontier model a million dollars and a company to run, and it will usually lose the money. Put the **same model** inside this harness — persistent memory, a decision cadence, a runway fence — and it survives the full 500-day exam. The model didn't change. The operating system around it did.
+
+That is the experiment this repo exists to run. [SWE-bench](https://arxiv.org/abs/2310.06770) showed that models fail at real software work. [SWE-agent](https://arxiv.org/abs/2405.15793) showed that the *interface around the model* was worth more than the next model upgrade. [CEO-Bench](https://arxiv.org/abs/2606.18543) moved the exam from fixing a GitHub issue to running a company for 500 simulated days — and most frontier agents went bankrupt. This repo applies the SWE-agent move to that exam: hold the economy fixed, swap the **company harness**, and measure in dollars what the operating system around a model is worth. The unit of evaluation is **Model × Harness × Policy × Environment** ([terminology](https://bench.clawbank.co/guide#words)), hosted at [ClawBank Business Bench](https://bench.clawbank.co).
+
+## The evidence so far
+
+Same model, same economy, same 500-day exam. The only difference between the columns is this harness ([live board](https://bench.clawbank.co/results)):
+
+| Model | Raw (thin agent) | Inside this harness |
+|---|---|---|
+| GPT-4.1-mini | **bankrupt**, day 57 | survives, **$902,566** |
+| Claude Sonnet 4.6 | **bankrupt**, day 418 | survives, **$869,000** |
+| Gemini 3 Flash | $602k avg (4 seeds) | **$827k avg** (4 seeds) |
+| GPT-4.1 | $853,315 | **$951,293** |
+
+Every completed pair, the harness wins. Two of the four models die without it.
 
 **The open challenge:** a company that does nothing pays only the $85/day capacity fee and finishes with $957,500 — and no run, raw or harnessed, has beaten that floor yet. Profitable play exists in this economy (cheap acquisition channels, positive unit economics after a quality unlock); no harness has found it. Finish above the floor and you top the board. Finish above the $1M start and you make history.
 
