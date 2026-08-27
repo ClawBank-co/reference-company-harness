@@ -39,7 +39,7 @@ from harness.trajectory import Trajectory
 SCENARIOS = {
     "conformance": "zhc-conformance-short-v0",
     "growth": "business-bench-growth-short-v0",
-    "full": "business-bench-default-v0",
+    "full": "business-bench-default-v1",
 }
 
 MANIFEST = {
